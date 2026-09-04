@@ -1,0 +1,4 @@
+#!/bin/sh
+# Called as: ./client/run-market-data 127.0.0.1 5000 JNST
+DIR="$(cd "$(dirname "$0")/.." && pwd)"
+exec "$DIR/bin/market_data_client" "$@"

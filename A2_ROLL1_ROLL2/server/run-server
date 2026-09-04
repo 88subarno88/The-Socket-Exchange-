@@ -1,0 +1,8 @@
+#!/bin/sh
+# Mandatory launcher (handout 6.0.2 / 7.2). The experiment harness calls:
+#   ./server/run-server 127.0.0.1 5000
+# We resolve the repo root from this script's own location so it works no
+# matter what the caller's current directory is, then exec the built binary.
+# `exec` replaces this shell with the server process (required by the handout).
+DIR="$(cd "$(dirname "$0")/.." && pwd)"
+exec "$DIR/bin/exchange_server" "$@"

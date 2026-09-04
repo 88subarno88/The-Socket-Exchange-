@@ -1,0 +1,4 @@
+#!/bin/sh
+# Called as: ./client/run-trader 127.0.0.1 5000 alice
+DIR="$(cd "$(dirname "$0")/.." && pwd)"
+exec "$DIR/bin/trader_client" "$@"
