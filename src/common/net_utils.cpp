@@ -16,6 +16,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cerrno>
+#include <cstdint>
 
 namespace net {
 
@@ -27,49 +28,85 @@ int set_nonblocking(int fd) {
     return 0;
 }
 
+// Fill a sockaddr_in from a dotted-quad host string and a port. Shared by the
+// listen and connect paths so the byte-order handling lives in exactly one place.
+// Returns 0 on success, -1 if `host` is not a valid IPv4 literal.
+//   NOTE: inet_pton takes a NUMERIC address only -- it does not resolve names.
+//   "localhost" therefore fails here on purpose; pass 127.0.0.1. Resolving names
+//   would mean getaddrinfo(), which the assignment does not need.
+static int fill_addr(const std::string& host, int port, struct sockaddr_in& addr) {
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons((uint16_t)port);   // host -> network byte order
+    if (host.empty() || host == "0.0.0.0") {
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);   // bind on every interface
+        return 0;
+    }
+    // inet_pton returns 1 on success, 0 on a malformed address, -1 on a bad family.
+    int rc = inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
+    if (rc != 1) {
+        fprintf(stderr, "bad IPv4 address: %s\n", host.c_str());
+        return -1;
+    }
+    return 0;
+}
+
 int make_listen_socket(const std::string& host, int port, int backlog) {
-    // ---- GUIDED SKELETON -- replace each TODO with the real syscall. ----
-    //
-    // 1) int fd = socket(AF_INET, SOCK_STREAM, 0);
-    //       check fd < 0 -> perror("socket"); return -1;
-    //
-    // 2) int yes = 1;
-    //    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-    //       WHY: without this, re-running the server right after it exits fails
-    //       with EADDRINUSE while the old socket sits in TIME_WAIT.
-    //
-    // 3) struct sockaddr_in addr; memset(&addr,0,sizeof addr);
-    //    addr.sin_family = AF_INET;
-    //    addr.sin_port   = htons(port);        // host->network byte order!
-    //    inet_pton(AF_INET, host.c_str(), &addr.sin_addr);   // "127.0.0.1"
-    //
-    // 4) bind(fd, (struct sockaddr*)&addr, sizeof addr);  check < 0
-    //
-    // 5) listen(fd, backlog);                             check < 0
-    //       backlog: pass SOMAXCONN (or your `backlog` arg).
-    //
-    // 6) return fd;
-    (void)host; (void)port; (void)backlog;
-    fprintf(stderr, "make_listen_socket: NOT IMPLEMENTED YET\n");
-    return -1;
+    // 1) socket(): allocate an endpoint. AF_INET + SOCK_STREAM = TCP over IPv4.
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { perror("socket"); return -1; }
+
+    // 2) SO_REUSEADDR: without it, restarting the server while the previous
+    //    listening address still sits in TIME_WAIT fails with EADDRINUSE.
+    int yes = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes) < 0) {
+        perror("setsockopt SO_REUSEADDR");
+        close(fd);
+        return -1;
+    }
+
+    // 3) Build the address to bind to.
+    struct sockaddr_in addr;
+    if (fill_addr(host, port, addr) < 0) { close(fd); return -1; }
+
+    // 4) bind(): claim the address:port for this socket.
+    if (bind(fd, (struct sockaddr*)&addr, sizeof addr) < 0) {
+        perror("bind");
+        close(fd);
+        return -1;
+    }
+
+    // 5) listen(): move the socket into LISTEN state so it can queue incoming
+    //    connections. This is the socket Experiment 1 sees as LISTEN in netstat.
+    if (listen(fd, backlog > 0 ? backlog : SOMAXCONN) < 0) {
+        perror("listen");
+        close(fd);
+        return -1;
+    }
+
+    return fd;
 }
 
 int connect_to(const std::string& host, int port) {
-    // ---- GUIDED SKELETON ----
-    //
-    // 1) int fd = socket(AF_INET, SOCK_STREAM, 0);   check < 0
-    // 2) struct sockaddr_in addr; memset(&addr,0,sizeof addr);
-    //    addr.sin_family = AF_INET;
-    //    addr.sin_port   = htons(port);
-    //    inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
-    // 3) connect(fd, (struct sockaddr*)&addr, sizeof addr);  check < 0
-    // 4) return fd;
-    //
-    // (For the BONUS 70k generator you'll want a NON-BLOCKING variant of this
-    //  so thousands of connects can be in flight at once -- see bonus/README note.)
-    (void)host; (void)port;
-    fprintf(stderr, "connect_to: NOT IMPLEMENTED YET\n");
-    return -1;
+    // 1) socket(): same endpoint creation as the server side.
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { perror("socket"); return -1; }
+
+    // 2) Build the peer address.
+    struct sockaddr_in addr;
+    if (fill_addr(host, port, addr) < 0) { close(fd); return -1; }
+
+    // 3) connect(): performs the TCP three-way handshake. On a BLOCKING fd this
+    //    returns only once the connection is ESTABLISHED (or has failed).
+    //    (The bonus generator wants a non-blocking variant so thousands of
+    //     handshakes can be in flight at once -- that one gets EINPROGRESS here.)
+    if (connect(fd, (struct sockaddr*)&addr, sizeof addr) < 0) {
+        perror("connect");
+        close(fd);
+        return -1;
+    }
+
+    return fd;
 }
 
 ssize_t send_all(int fd, const char* data, size_t len) {

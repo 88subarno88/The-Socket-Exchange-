@@ -20,6 +20,8 @@
 
 #include <string>
 #include <cstddef>
+#include <sys/types.h>   // ssize_t (used below) -- POSIX, not pulled in by <string>
+                         // on FreeBSD's libc++, only by glibc's libstdc++ by luck
 
 namespace net {
 

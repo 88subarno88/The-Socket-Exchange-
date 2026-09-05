@@ -19,6 +19,9 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <map>
+#include <deque>
+#include <unordered_map>
 
 enum class Side { BUY, SELL };
 
@@ -85,5 +88,21 @@ public:
 
 private:
     long long next_id_ = 0;
-    // TODO: declare your book storage here (see hint above).
+
+    // STORAGE / MATCHING POLICY (document this in report.pdf):
+    //   books_[instrument] holds two price-keyed maps, one per side. Each price
+    //   level is a deque used strictly as FIFO: new orders push_back, matching
+    //   consumes from the front, so the OLDEST resting order at a price trades
+    //   first (time priority). Since handout 2.6 only ever matches at EXACTLY
+    //   equal price, matching is a single lookup of the opposite side at
+    //   o.price -- no best-price search is needed. std::map (ordered) rather
+    //   than unordered_map keeps price levels in a predictable order, which
+    //   makes the book easy to dump and reason about in the viva.
+    //   INVARIANT: a price level is erased as soon as its deque empties, so an
+    //   empty deque never lingers in the map.
+    struct InstrumentBook {
+        std::map<long long, std::deque<Order>> buys;   // price -> FIFO of resting BUYs
+        std::map<long long, std::deque<Order>> sells;  // price -> FIFO of resting SELLs
+    };
+    std::unordered_map<std::string, InstrumentBook> books_;   // instrument -> its book
 };

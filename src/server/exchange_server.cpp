@@ -34,8 +34,11 @@
 #include <sys/types.h>
 #include <sys/event.h>     // kqueue / kevent
 #include <sys/socket.h>
+#include <netinet/in.h>    // struct sockaddr_in
+#include <arpa/inet.h>     // inet_ntop
 #include <unistd.h>
 #include <csignal>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -127,45 +130,114 @@ static void handle_line(Server& s, ClientSession& c, const std::string& line) {
 
 // Tear down a connection: remove resting orders, unregister from kqueue, close.
 static void close_session(Server& s, int fd) {
-    // TODO:
-    //   s.book.remove_orders_of(fd);
-    //   s.kq_del(fd, EVFILT_READ);  (and EVFILT_WRITE if armed)
-    //   close(fd);
-    //   s.sessions.erase(fd);
-    // Deleting from kqueue happens automatically on close(), but doing it
-    // explicitly makes the lifecycle obvious.
-    (void)s; (void)fd;
+    auto it = s.sessions.find(fd);
+    if (it == s.sessions.end()) return;   // already torn down -- never double-close
+
+    // Drop this trader's resting orders so nothing can match against a ghost
+    // (handout 4.4). Harmless for market-data sessions, which own no orders.
+    s.book.remove_orders_of(fd);
+
+    // close() would remove the kqueue registrations by itself; doing it
+    // explicitly keeps the connection lifecycle visible in the code.
+    s.kq_del(fd, EVFILT_READ);
+    if (it->second.want_write) s.kq_del(fd, EVFILT_WRITE);
+
+    close(fd);
+    s.sessions.erase(it);
+    printf("[-] fd=%d closed (%zu client(s) still connected)\n", fd, s.sessions.size());
+    fflush(stdout);
 }
 
 // Accept ALL pending connections (loop until accept() returns EAGAIN, because
 // one EVFILT_READ on the listen socket can mean several queued connections).
 static void accept_new(Server& s) {
-    // TODO:
-    //   for (;;) {
-    //     int cfd = accept(s.listen_fd, nullptr, nullptr);
-    //     if (cfd < 0) { if errno==EAGAIN/EWOULDBLOCK break; else perror+break; }
-    //     net::set_nonblocking(cfd);
-    //     s.sessions[cfd] = ClientSession{}; s.sessions[cfd].fd = cfd;
-    //     s.kq_add(cfd, EVFILT_READ);
-    //   }
-    (void)s;
+    for (;;) {
+        struct sockaddr_in peer;
+        socklen_t plen = sizeof peer;
+        int cfd = accept(s.listen_fd, (struct sockaddr*)&peer, &plen);
+        if (cfd < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;  // queue drained
+            if (errno == EINTR) continue;                        // signal, retry
+            // The peer vanished between the SYN and our accept(). Not our
+            // problem -- skip it and keep serving everyone else.
+            if (errno == ECONNABORTED) continue;
+            perror("accept");
+            break;
+        }
+
+        // Non-blocking is mandatory: with a readiness-based loop, a blocking
+        // recv()/send() on ONE socket would stall every other client.
+        net::set_nonblocking(cfd);
+
+        ClientSession& c = s.sessions[cfd];
+        c.fd = cfd;
+        s.kq_add(cfd, EVFILT_READ);
+
+        char ip[INET_ADDRSTRLEN] = {0};
+        inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof ip);
+        printf("[+] accepted fd=%d from %s:%d (%zu client(s) connected)\n",
+               cfd, ip, ntohs(peer.sin_port), s.sessions.size());
+        fflush(stdout);
+    }
 }
 
 // A socket is readable: recv into a temp buffer, feed the LineBuffer, then pull
 // out and handle every complete line. recv()==0 means orderly FIN (Experiment 6
 // FIN case / Experiment 8); recv()<0 with ECONNRESET means an RST (abrupt).
 static void on_readable(Server& s, int fd) {
-    // TODO:
-    //   char tmp[4096];
-    //   for (;;) {
-    //     ssize_t n = recv(fd, tmp, sizeof tmp, 0);
-    //     if (n > 0) { session.inbuf.feed(tmp, n);
-    //                  std::string ln; while (session.inbuf.next_line(ln)) handle_line(...); }
-    //     else if (n == 0) { close_session(s, fd); return; }   // peer sent FIN
-    //     else { if errno==EAGAIN/EWOULDBLOCK break;            // drained
-    //            if errno==ECONNRESET -> close_session; else perror+close; return; }
-    //   }
-    (void)s; (void)fd;
+    // handle_line/broadcast_trade get wired up in Phase 6/7. Reference them so
+    // -Wunused-function stays quiet until then; delete once handle_line() is
+    // actually called from the loop below.
+    (void)&handle_line; (void)&broadcast_trade;
+
+    auto it = s.sessions.find(fd);
+    if (it == s.sessions.end()) return;
+    ClientSession& c = it->second;
+
+    char tmp[4096];
+    for (;;) {
+        ssize_t n = recv(fd, tmp, sizeof tmp, 0);
+
+        if (n > 0) {
+            // EXPERIMENT 3 EVIDENCE: logging the raw recv() size next to the
+            // lines it yielded is what shows that recv boundaries and message
+            // boundaries are unrelated -- one recv can carry half a message or
+            // several messages.
+            printf("[%d] recv() -> %zd byte(s)\n", fd, n);
+            c.inbuf.feed(tmp, (size_t)n);
+
+            std::string line;
+            while (c.inbuf.next_line(line)) {
+                // PHASE 3 is print-only so framing can be watched over a real
+                // socket. PHASE 6 replaces this printf with:
+                //     handle_line(s, c, line);
+                printf("[%d] %s\n", fd, line.c_str());
+            }
+            fflush(stdout);
+            continue;   // keep draining: the socket may hold more bytes
+        }
+
+        if (n == 0) {
+            // Orderly shutdown: the peer sent FIN (Experiment 6 FIN case).
+            printf("[%d] recv() -> 0 : peer closed (FIN)\n", fd);
+            fflush(stdout);
+            close_session(s, fd);
+            return;                       // `c` is dangling now -- must not touch it
+        }
+
+        if (errno == EINTR) continue;                          // signal, retry
+        if (errno == EAGAIN || errno == EWOULDBLOCK) break;    // fully drained
+
+        if (errno == ECONNRESET) {
+            // Abrupt teardown: the peer sent RST (Experiment 6 RST case).
+            printf("[%d] recv() -> ECONNRESET : peer reset (RST)\n", fd);
+            fflush(stdout);
+        } else {
+            perror("recv");
+        }
+        close_session(s, fd);
+        return;
+    }
 }
 
 // A socket is writable: flush queued output (backpressure drain, Experiment 7).
@@ -193,32 +265,78 @@ int main(int argc, char** argv) {
     if (s.listen_fd < 0) return 1;
     net::set_nonblocking(s.listen_fd);
 
-    // TODO: s.kq = kqueue();  check < 0
-    //       s.kq_add(s.listen_fd, EVFILT_READ);
+    s.kq = kqueue();
+    if (s.kq < 0) { perror("kqueue"); close(s.listen_fd); return 1; }
+
+    // Watch the listening socket. It becomes "readable" when a connection is
+    // waiting to be accept()ed.
+    s.kq_add(s.listen_fd, EVFILT_READ);
+
+    printf("exchange_server listening on %s:%d (kqueue fd=%d, listen fd=%d)\n",
+           host.c_str(), port, s.kq, s.listen_fd);
+    fflush(stdout);
 
     // ---- Event loop ----------------------------------------------------------
-    // struct kevent events[1024];
-    // for (;;) {
-    //   int n = kevent(s.kq, nullptr, 0, events, 1024, nullptr); // block till ready
-    //   for (int i = 0; i < n; i++) {
-    //     int fd = (int)events[i].ident;
-    //     if (fd == s.listen_fd)            accept_new(s);
-    //     else if (events[i].filter == EVFILT_READ)  on_readable(s, fd);
-    //     else if (events[i].filter == EVFILT_WRITE) on_writable(s, fd);
-    //     // also check events[i].flags & EV_EOF for early hangup detection.
-    //   }
-    // }
-    fprintf(stderr, "exchange_server: event loop not implemented yet\n");
+    // ONE thread, ALL sockets. kevent() blocks until at least one fd is ready,
+    // then hands back only the ready ones -- so an idle client costs nothing and
+    // can never delay another (Experiments 4/5).
+    struct kevent events[1024];
+    for (;;) {
+        int n = kevent(s.kq, nullptr, 0, events, 1024, nullptr);  // block
+        if (n < 0) {
+            if (errno == EINTR) continue;   // interrupted by a signal, not an error
+            perror("kevent");
+            break;
+        }
+
+        for (int i = 0; i < n; i++) {
+            const int fd = (int)events[i].ident;
+
+            if (events[i].flags & EV_ERROR) {
+                fprintf(stderr, "kevent error on fd=%d: %s\n",
+                        fd, strerror((int)events[i].data));
+                if (fd != s.listen_fd) close_session(s, fd);
+                continue;
+            }
+
+            if (fd == s.listen_fd) { accept_new(s); continue; }
+
+            if (events[i].filter == EVFILT_READ) {
+                on_readable(s, fd);
+                // on_readable may already have torn the session down (FIN/RST).
+                // Only then consider EV_EOF, so we never close the same fd twice.
+                if (s.sessions.count(fd) && (events[i].flags & EV_EOF)) {
+                    close_session(s, fd);
+                }
+            } else if (events[i].filter == EVFILT_WRITE) {
+                on_writable(s, fd);   // Phase 9: backpressure drain
+            }
+        }
+    }
+
+    close(s.listen_fd);
+    close(s.kq);
     return 0;
 }
 
 // ---- kqueue registration helpers -------------------------------------------
+// EV_SET only fills in a struct kevent; it is kevent() itself that hands the
+// change to the kernel. Passing the changelist with a NULL eventlist means
+// "apply these changes, return immediately, don't wait for events".
 void Server::kq_add(int fd, int filter) {
-    // TODO: struct kevent ev; EV_SET(&ev, fd, filter, EV_ADD|EV_ENABLE, 0,0,NULL);
-    //       kevent(kq, &ev, 1, nullptr, 0, nullptr);
-    (void)fd; (void)filter;
+    struct kevent ev;
+    EV_SET(&ev, fd, filter, EV_ADD | EV_ENABLE, 0, 0, nullptr);
+    if (kevent(kq, &ev, 1, nullptr, 0, nullptr) < 0) {
+        perror("kevent EV_ADD");
+    }
 }
+
 void Server::kq_del(int fd, int filter) {
-    // TODO: EV_SET(&ev, fd, filter, EV_DELETE, 0,0,NULL); kevent(...)
-    (void)fd; (void)filter;
+    struct kevent ev;
+    EV_SET(&ev, fd, filter, EV_DELETE, 0, 0, nullptr);
+    // ENOENT just means the filter was never armed (or close() already dropped
+    // it). That is normal during teardown, so don't cry wolf about it.
+    if (kevent(kq, &ev, 1, nullptr, 0, nullptr) < 0 && errno != ENOENT) {
+        perror("kevent EV_DELETE");
+    }
 }

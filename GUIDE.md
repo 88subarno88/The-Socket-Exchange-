@@ -69,7 +69,8 @@ assignment.
 int main(){
   net::LineBuffer lb; std::string out;
   lb.feed("BU", 2);                 assert(!lb.next_line(out));   // partial
-  lb.feed("Y JNST 100 238\nSE", 16);
+  lb.feed("Y JNST 100 238\nSE", 17);   // 17 bytes, not 16 -- an off-by-one here
+                                       // silently truncates the feed
   assert(lb.next_line(out) && out=="BUY JNST 100 238");          // 1st complete
   assert(!lb.next_line(out));                                    // "SE" partial
   lb.feed("LL JNST 60 238\nCANCEL 1\n", 24);
