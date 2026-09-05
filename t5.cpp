@@ -56,27 +56,27 @@ int main() {
     { // --- 5. cancel: owner-only, unknown id, and no double-cancel ---
         OrderBook b;
         long long id = b.next_id();
-        b.submit({id, Side::BUY, "JNST", 100, 238, 7});
-        assert(!b.cancel(id, 8));            // not your order
-        assert(!b.cancel(999, 7));           // no such order
-        assert( b.cancel(id, 7));            // yours -> ok
-        assert(!b.cancel(id, 7));            // already gone
+        b.submit({id, Side::BUY, "JNST", 100, 238, 7, /*seq*/1});
+        assert(!b.cancel(id, 8, 1));         // not your order
+        assert(!b.cancel(999, 7, 1));        // no such order
+        assert( b.cancel(id, 7, 1));         // yours -> ok
+        assert(!b.cancel(id, 7, 1));         // already gone
         // and it really left the book: nothing to match against
         assert(b.submit({b.next_id(), Side::SELL, "JNST", 100, 238, 9}).empty());
     }
     { // --- 6. a fully-filled order can no longer be cancelled ---
         OrderBook b;
         long long id = b.next_id();
-        b.submit({id, Side::BUY, "JNST", 60, 238, 7});
-        b.submit({b.next_id(), Side::SELL, "JNST", 60, 238, 8});   // fills it completely
-        assert(!b.cancel(id, 7));            // handout: only unfulfilled qty is cancellable
+        b.submit({id, Side::BUY, "JNST", 60, 238, 7, /*seq*/1});
+        b.submit({b.next_id(), Side::SELL, "JNST", 60, 238, 8, /*seq*/2});
+        assert(!b.cancel(id, 7, 1));         // handout: only unfulfilled qty is cancellable
     }
     { // --- 7. a PARTIALLY filled order keeps its remainder and is cancellable ---
         OrderBook b;
         long long id = b.next_id();
-        b.submit({id, Side::BUY, "JNST", 100, 238, 7});
-        b.submit({b.next_id(), Side::SELL, "JNST", 60, 238, 8});   // 40 left resting
-        assert(b.cancel(id, 7));
+        b.submit({id, Side::BUY, "JNST", 100, 238, 7, /*seq*/1});
+        b.submit({b.next_id(), Side::SELL, "JNST", 60, 238, 8, /*seq*/2});   // 40 left resting
+        assert(b.cancel(id, 7, 1));
         assert(b.submit({b.next_id(), Side::SELL, "JNST", 40, 238, 9}).empty());
     }
     { // --- 8. remove_orders_of touches only that fd, across instruments/sides ---
@@ -100,6 +100,22 @@ int main() {
         assert(b.submit({b.next_id(), Side::BUY, "JNST", -5, 238, 7}).empty());
         // neither should have rested, so a matching SELL finds nothing
         assert(b.submit({b.next_id(), Side::SELL, "JNST", 1, 238, 8}).empty());
+    }
+    { // --- 10. an order outlives its owner: the same fd, a DIFFERENT session,
+      //         must not be able to cancel it, and Fills carry both sides' seq ---
+        OrderBook b;
+        long long id = b.next_id();
+        b.submit({id, Side::BUY, "JNST", 100, 238, /*fd*/7, /*seq*/1});
+        assert(!b.cancel(id, 7, 2));         // right fd, WRONG session -> refused
+        assert(!b.cancel(id, 7, 0));         // an unstamped caller too
+        assert( b.cancel(id, 7, 1));         // the actual owner -> ok
+
+        long long id2 = b.next_id();
+        b.submit({id2, Side::BUY, "JNST", 10, 238, /*fd*/7, /*seq*/1});
+        auto f = b.submit({b.next_id(), Side::SELL, "JNST", 10, 238, /*fd*/9, /*seq*/4});
+        assert(f.size() == 1);
+        assert(f[0].buyer_fd == 7 && f[0].buyer_seq == 1);   // server checks these
+        assert(f[0].sell_fd  == 9 && f[0].sell_seq  == 4);   // before BOUGHT/SOLD
     }
     puts("matching OK");
 }

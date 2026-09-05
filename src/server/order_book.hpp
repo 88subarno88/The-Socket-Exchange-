@@ -33,8 +33,11 @@ struct Order {
     long long   qty;         // REMAINING quantity (decreases as it fills)
     long long   price;
     int         owner_fd;    // which trader connection submitted it
-    // TODO (optional): a monotonically increasing sequence number if you want
-    // strict FIFO independent of id; id already increases, so id works as tie-break.
+    // Identifies WHICH session on owner_fd placed this, so a later client that
+    // inherits the same fd number is never mistaken for the original owner.
+    // Orders survive their owner's disconnect (handout 2.6), which is precisely
+    // when fd reuse becomes possible.
+    unsigned long long owner_seq = 0;
 };
 
 // One execution against one resting order. The server converts each Fill into:
@@ -47,6 +50,12 @@ struct Fill {
     long long   price;
     int         buyer_fd;
     int         sell_fd;
+    // The session each side belonged to. The server sends BOUGHT/SOLD only when
+    // the fd's CURRENT session still matches -- otherwise the trader has gone
+    // and, per handout 2.6, gets no execution report while the TRADE broadcast
+    // to market-data subscribers still happens.
+    unsigned long long buyer_seq = 0;
+    unsigned long long sell_seq  = 0;
 };
 
 class OrderBook {
@@ -79,7 +88,7 @@ public:
     // Rules: order must exist, still have unfilled qty, AND belong to requester_fd.
     // On success remove it and return true. On any failure return false (server
     // then sends ERROR).
-    bool cancel(long long order_id, int requester_fd);
+    bool cancel(long long order_id, int requester_fd, unsigned long long requester_seq);
 
     // When a trader disconnects, drop all their resting orders so they can't
     // match against ghosts. (Handout 4.4: one client's failure must not corrupt

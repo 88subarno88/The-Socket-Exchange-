@@ -25,6 +25,14 @@ enum class Role { UNKNOWN, TRADER, MARKET_DATA };
 
 struct ClientSession {
     int             fd = -1;
+
+    // WHY THIS EXISTS: an order outlives its owner's connection (handout 2.6),
+    // but the kernel recycles fds immediately on close -- so the NEXT client to
+    // connect can be handed the same fd number. Identifying an order's owner by
+    // fd alone would let that stranger receive the departed trader's BOUGHT/SOLD
+    // and cancel their orders. `session_seq` is unique for the server's lifetime,
+    // so (fd, session_seq) names one connection and never a later reuse of it.
+    unsigned long long session_seq = 0;
     Role            role = Role::UNKNOWN;
     std::string     username;                 // set on successful LOGIN (traders)
     std::set<std::string> subscriptions;      // instruments (market-data clients)

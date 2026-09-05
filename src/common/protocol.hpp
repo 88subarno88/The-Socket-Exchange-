@@ -27,14 +27,21 @@ inline const char* INSTRUMENTS[] = {"JNST", "IMCT"};
 // Returns true iff `s` is one of INSTRUMENTS. Implemented in protocol.cpp.
 bool is_valid_instrument(const std::string& s);
 
-// TODO: parse a positive integer strictly.
-//   Return false if the string is empty, has non-digit chars, is 0, is
-//   negative, or overflows. The spec forbids decimals and negatives, so reject
-//   anything that isn't a clean run of digits. Do NOT use atoi() (it silently
-//   ignores garbage). Prefer std::from_chars or a manual digit loop.
+// Parse a strictly POSITIVE integer. False if empty, non-digit, 0, negative, or
+// overflowing. Decimals and signs are rejected -- only a clean run of digits
+// passes. (atoi() is unusable here: it silently ignores trailing garbage.)
 //   WHY strict: Experiment/grading will throw malformed input at you and expect
 //   an ERROR response, not a crash.
+//   USE FOR: quantity and price (handout 2.1).
 bool parse_positive_int(const std::string& s, long long& out);
+
+// Same strictness, but 0 is ALLOWED.
+//   USE FOR: order ids, and nothing else.
+//   WHY a separate function: handout 2.1 draws a real distinction -- quantity
+//   and price must be POSITIVE, while order ids are only NON-NEGATIVE, and the
+//   very first order the server issues has id 0. Validating "CANCEL 0" with
+//   parse_positive_int would reject a legal request -- the README's own example.
+bool parse_nonnegative_int(const std::string& s, long long& out);
 
 // Split a single already-de-framed line into whitespace-separated tokens.
 // Example: "BUY JNST 100 238" -> ["BUY","JNST","100","238"].

@@ -47,8 +47,13 @@ std::vector<Fill> OrderBook::submit(Order o) {
             f.qty        = traded;
             f.price      = o.price;   // both sides agree on price by construction
             // Whichever side is the BUY supplies buyer_fd; the other supplies sell_fd.
-            if (o.side == Side::BUY) { f.buyer_fd = o.owner_fd;       f.sell_fd = resting.owner_fd; }
-            else                     { f.buyer_fd = resting.owner_fd; f.sell_fd = o.owner_fd; }
+            if (o.side == Side::BUY) {
+                f.buyer_fd = o.owner_fd;       f.buyer_seq = o.owner_seq;
+                f.sell_fd  = resting.owner_fd; f.sell_seq  = resting.owner_seq;
+            } else {
+                f.buyer_fd = resting.owner_fd; f.buyer_seq = resting.owner_seq;
+                f.sell_fd  = o.owner_fd;       f.sell_seq  = o.owner_seq;
+            }
             fills.push_back(f);
 
             o.qty       -= traded;
@@ -72,7 +77,8 @@ std::vector<Fill> OrderBook::submit(Order o) {
     return fills;
 }
 
-bool OrderBook::cancel(long long order_id, int requester_fd) {
+bool OrderBook::cancel(long long order_id, int requester_fd,
+                       unsigned long long requester_seq) {
     // Order ids are unique for the server's lifetime, so the first match is THE
     // order. Anything still in the book necessarily has qty > 0 (fully-filled
     // orders are erased at match time), so "still has unfilled quantity" needs
@@ -85,8 +91,12 @@ bool OrderBook::cancel(long long order_id, int requester_fd) {
                 for (auto it = queue.begin(); it != queue.end(); ++it) {
                     if (it->id != order_id) continue;
 
-                    // Found it -- but you may only cancel your OWN order.
+                    // Found it -- but you may only cancel your OWN order. The fd
+                    // alone is not enough: an order can outlive its owner
+                    // (handout 2.6) and a later client may be handed the same fd.
+                    // The session must match too.
                     if (it->owner_fd != requester_fd) return false;
+                    if (it->owner_seq != requester_seq) return false;
 
                     queue.erase(it);
                     if (queue.empty()) side->erase(lvl);

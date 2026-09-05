@@ -19,10 +19,10 @@ bool is_valid_instrument(const std::string& s) {
     return false;
 }
 
-bool parse_positive_int(const std::string& s, long long& out) {
+bool parse_nonnegative_int(const std::string& s, long long& out) {
     // Strict per handout 2.1: digits only, no sign, no decimal point, no
-    // leading/trailing space, and the result must be > 0. Anything else is an
-    // ERROR response upstream, never a crash.
+    // leading/trailing space. Anything else must become an ERROR response
+    // upstream, never a crash. 0 IS accepted here -- see the header for why.
     if (s.empty()) {
         return false;
     }
@@ -30,7 +30,7 @@ bool parse_positive_int(const std::string& s, long long& out) {
     // "-5", "+5", "12a", "1.5" and " 7" before from_chars ever sees them.
     for (char c : s) {
         if (!std::isdigit(static_cast<unsigned char>(c))) {
-            return false; 
+            return false;
         }
     }
     // from_chars reports overflow as result_out_of_range instead of wrapping.
@@ -38,11 +38,14 @@ bool parse_positive_int(const std::string& s, long long& out) {
     if (ec != std::errc()) {
         return false;
     }
-    // Only "0" (or "000") can reach here non-positive.
-    if (out <= 0) {
-        return false;
-    }
     return true;
+}
+
+bool parse_positive_int(const std::string& s, long long& out) {
+    // Identical parsing, one extra rule: quantity and price must be > 0.
+    // Only "0" (or "000") can reach the check non-positive.
+    if (!parse_nonnegative_int(s, out)) return false;
+    return out > 0;
 }
 
 std::vector<std::string> tokenize(const std::string& line) {
