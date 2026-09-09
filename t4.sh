@@ -12,7 +12,7 @@ PORT=5000
 FAKE=5001
 ok=0
 
-pkill -f exchange_server 2>/dev/null; pkill nc 2>/dev/null; sleep 1
+pkill -x exchange_server 2>/dev/null; pkill nc 2>/dev/null; sleep 1
 SRV=/tmp/p4_srv.log; rm -f $SRV
 ./server/run-server 127.0.0.1 $PORT > $SRV 2>&1 &
 SPID=$!

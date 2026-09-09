@@ -1,31 +1,3 @@
-// ============================================================================
-// exchange_server.cpp  --  The Exchange Server (handout 3.1).
-//
-// CONCURRENCY / I/O CHOICE (handout 4.7 + report 8.1):
-//   This skeleton uses a SINGLE-THREADED EVENT LOOP built on kqueue() -- the
-//   native FreeBSD I/O-multiplexing facility. One thread watches ALL sockets;
-//   it only ever touches a socket the kernel says is ready, so an idle client
-//   can never block progress on another (this is the point of Experiments 4/5),
-//   and there is no per-connection thread cost (this is what makes the 70k
-//   bonus feasible).
-//
-//   Alternatives you could justify instead:
-//     * poll()  -- portable, simpler API, O(n) scan each loop. Fine for this
-//                  assignment's scale; swap kevent() for poll() if you prefer.
-//     * thread-per-connection -- simplest to reason about, but Experiment 4
-//                  becomes trivially "no it doesn't stall" only if EACH thread
-//                  blocks independently, and the 70k bonus will drown in thread
-//                  memory. If you pick this, be ready to defend it in the viva.
-//
-// LEARN kqueue:
-//   man 2 kqueue   (read the EXAMPLE section at the bottom -- it's excellent)
-//   "Kqueue: A Generic and Scalable Event Notification Facility", J. Lemon.
-//   Beej's guide covers poll()/select(); kqueue is the FreeBSD upgrade path.
-//
-// USAGE (called by server/run-server):   ./exchange_server <host> <port>
-//   e.g.  ./exchange_server 127.0.0.1 5000
-// ============================================================================
-
 #include "../common/net_utils.hpp"
 #include "../common/protocol.hpp"
 #include "order_book.hpp"
@@ -53,9 +25,6 @@ struct Server {
     OrderBook book;
     std::unordered_map<int, ClientSession> sessions; // fd -> session
 
-    // Never reused, never reset: stamped onto each accepted session so an fd
-    // recycled by the kernel is still distinguishable from the session that
-    // owned it before. See ClientSession::session_seq.
     unsigned long long next_session_seq = 1;
 
     // Register/unregister interest in a socket. Wrap EV_SET + kevent() so the
@@ -68,11 +37,6 @@ struct Server {
 // before close_session, so declare it up front.
 static void close_session(Server& s, int fd);
 
-// ---------------------------------------------------------------------------
-// Queue a line to a client. Appends '\n' (frames it), tries an immediate send,
-// and on partial send stashes the remainder + arms EVFILT_WRITE.
-// This ONE helper is what protects you in Experiment 7.
-// ---------------------------------------------------------------------------
 static void enqueue(Server& s, ClientSession& c, const std::string& line) {
     // The '\n' is added HERE and nowhere else, so a line can never be double-framed.
     const std::string framed = line + "\n";
@@ -92,15 +56,9 @@ static void enqueue(Server& s, ClientSession& c, const std::string& line) {
         if (n < 0 && errno == EINTR) continue;
         // The peer's receive window is full -- this is backpressure, not failure.
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
-        // Hard error (EPIPE after SIGPIPE was ignored, ECONNRESET, ...). Don't
-        // tear the session down from the write path; the read side will see it
-        // and run close_session() once, in one place.
         return;
     }
 
-    // Short write: park the tail and ask to be told when the socket drains.
-    // WITHOUT this, one slow market-data client would stall the whole server
-    // (Experiment 7); WITH it, the backlog stays on that client's own fd.
     if (sent < framed.size()) {
         c.outbuf.push_back(framed.substr(sent));
         if (!c.want_write) {
@@ -110,16 +68,10 @@ static void enqueue(Server& s, ClientSession& c, const std::string& line) {
     }
 }
 
-// Broadcast a TRADE to every market-data session subscribed to `instrument`.
-// This is the one-to-many push of handout 2.5: the recipients asked for nothing,
-// and the message says only what happened -- never who was on which side.
 static void broadcast_trade(Server& s, const std::string& instrument,
                             long long qty, long long price) {
     const std::string msg = proto::msg_trade(instrument, qty, price);
 
-    // Safe to iterate while enqueueing: enqueue() only appends to a session's
-    // outbuf and may arm EVFILT_WRITE -- it never erases a session. (That is
-    // exactly why enqueue() leaves teardown to the read path.)
     for (auto& kv : s.sessions) {
         ClientSession& sub = kv.second;
         if (sub.role != Role::MARKET_DATA) continue;         // traders never get TRADE
@@ -128,23 +80,11 @@ static void broadcast_trade(Server& s, const std::string& instrument,
     }
 }
 
-// ---------------------------------------------------------------------------
-// Dispatch ONE fully-framed command line from client `c`.
-// This is the protocol brain. Structure it as: tokenize -> switch on tokens[0].
-//
-// RETURNS false if the session was closed (QUIT). The caller MUST stop touching
-// `c` immediately in that case -- close_session() erases it from s.sessions, so
-// the reference dangles the moment we return.
-// ---------------------------------------------------------------------------
 static bool handle_line(Server& s, ClientSession& c, const std::string& line) {
     auto t = proto::tokenize(line);
     if (t.empty()) { enqueue(s, c, proto::msg_error("empty")); return true; }
     const std::string& cmd = t[0];
 
-    // ---- ROLE INFERENCE + ENFORCEMENT (handout 2.8) -------------------------
-    // There is no handshake in the protocol, so the FIRST role-specific command
-    // decides what this connection is. QUIT is deliberately excluded: it is legal
-    // for both roles, so it must not pin down an as-yet-unknown one.
     const bool trader_cmd = (cmd == "LOGIN" || cmd == "BUY" ||
                              cmd == "SELL"  || cmd == "CANCEL");
     const bool md_cmd     = (cmd == "SUBSCRIBE" || cmd == "UNSUBSCRIBE");
@@ -192,11 +132,11 @@ static bool handle_line(Server& s, ClientSession& c, const std::string& line) {
         }
         long long qty = 0, price = 0;
         if (!proto::parse_positive_int(t[2], qty)) {
-            enqueue(s, c, proto::msg_error("quantity must be a positive integer"));
+            enqueue(s, c, proto::msg_error("quantity must be an integer in 1..2147483647"));
             return true;
         }
         if (!proto::parse_positive_int(t[3], price)) {
-            enqueue(s, c, proto::msg_error("price must be a positive integer"));
+            enqueue(s, c, proto::msg_error("price must be an integer in 1..2147483647"));
             return true;
         }
 
@@ -214,14 +154,6 @@ static bool handle_line(Server& s, ClientSession& c, const std::string& line) {
         enqueue(s, c, proto::msg_order_accepted(o.id));
 
         for (const Fill& f : s.book.submit(o)) {
-            // BOUGHT/SOLD are PRIVATE execution reports for the two traders
-            // involved; TRADE is the public one. A fill's counterparty may be
-            // this same session (self-match is not forbidden by the handout),
-            // in which case it correctly receives both BOUGHT and SOLD.
-            // Handout 2.6: if a side has disconnected, the trade still happens
-            // but that side gets no execution report. Matching session_seq (not
-            // just fd) is what stops a NEW client on a recycled fd from
-            // receiving a departed trader's BOUGHT/SOLD.
             auto buyer = s.sessions.find(f.buyer_fd);
             if (buyer != s.sessions.end() && buyer->second.session_seq == f.buyer_seq)
                 enqueue(s, buyer->second, proto::msg_bought(f.instrument, f.qty, f.price));
@@ -242,12 +174,9 @@ static bool handle_line(Server& s, ClientSession& c, const std::string& line) {
         // NOTE: non-negative, NOT positive -- id 0 is the first order the server
         // ever issues and must be cancellable (handout 2.1).
         if (!proto::parse_nonnegative_int(t[1], oid)) {
-            enqueue(s, c, proto::msg_error("order id must be a non-negative integer"));
+            enqueue(s, c, proto::msg_error("order id must be an integer in 0..2147483647"));
             return true;
         }
-        // The book enforces ownership and existence in one place: cancel()
-        // fails for an unknown id, an already-filled/cancelled order, and
-        // anyone else's order alike.
         if (s.book.cancel(oid, c.fd, c.session_seq)) {
             // Success is ORDER_CANCELLED, not OK (handout 2.3).
             enqueue(s, c, proto::msg_order_cancelled(oid));
@@ -291,14 +220,6 @@ static bool handle_line(Server& s, ClientSession& c, const std::string& line) {
 static void close_session(Server& s, int fd) {
     auto it = s.sessions.find(fd);
     if (it == s.sessions.end()) return;   // already torn down -- never double-close
-
-    // Handout 2.6 ("Connection termination and outstanding orders"): closing a
-    // Trader Client's connection does NOT cancel its accepted-but-unexecuted
-    // orders. They stay in the book and may still be matched; the departed
-    // trader simply receives no BOUGHT/SOLD, while subscribed Market-Data
-    // Clients still receive the TRADE. So we deliberately do NOT call
-    // book.remove_orders_of(fd) here -- ClientSession::session_seq is what keeps
-    // a recycled fd from impersonating the original owner.
 
     // close() would remove the kqueue registrations by itself; doing it
     // explicitly keeps the connection lifecycle visible in the code.
@@ -345,9 +266,6 @@ static void accept_new(Server& s) {
     }
 }
 
-// A socket is readable: recv into a temp buffer, feed the LineBuffer, then pull
-// out and handle every complete line. recv()==0 means orderly FIN (Experiment 6
-// FIN case / Experiment 8); recv()<0 with ECONNRESET means an RST (abrupt).
 static void on_readable(Server& s, int fd) {
     auto it = s.sessions.find(fd);
     if (it == s.sessions.end()) return;
@@ -358,10 +276,6 @@ static void on_readable(Server& s, int fd) {
         ssize_t n = recv(fd, tmp, sizeof tmp, 0);
 
         if (n > 0) {
-            // EXPERIMENT 3 EVIDENCE: logging the raw recv() size next to the
-            // lines it yielded is what shows that recv boundaries and message
-            // boundaries are unrelated -- one recv can carry half a message or
-            // several messages.
             printf("[%d] recv() -> %zd byte(s)\n", fd, n);
             c.inbuf.feed(tmp, (size_t)n);
 
@@ -457,10 +371,6 @@ int main(int argc, char** argv) {
            host.c_str(), port, s.kq, s.listen_fd);
     fflush(stdout);
 
-    // ---- Event loop ----------------------------------------------------------
-    // ONE thread, ALL sockets. kevent() blocks until at least one fd is ready,
-    // then hands back only the ready ones -- so an idle client costs nothing and
-    // can never delay another (Experiments 4/5).
     struct kevent events[1024];
     for (;;) {
         int n = kevent(s.kq, nullptr, 0, events, 1024, nullptr);  // block
@@ -500,10 +410,6 @@ int main(int argc, char** argv) {
     return 0;
 }
 
-// ---- kqueue registration helpers -------------------------------------------
-// EV_SET only fills in a struct kevent; it is kevent() itself that hands the
-// change to the kernel. Passing the changelist with a NULL eventlist means
-// "apply these changes, return immediately, don't wait for events".
 void Server::kq_add(int fd, int filter) {
     struct kevent ev;
     EV_SET(&ev, fd, filter, EV_ADD | EV_ENABLE, 0, 0, nullptr);

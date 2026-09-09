@@ -48,16 +48,32 @@ try:
                      ("BUY JNST 10 0",    "zero price"),
                      ("BUY JNST 10x 238", "non-numeric quantity"),
                      ("BUY AAPL 10 238",  "unknown instrument"),
-                     ("BUY JNST 10",      "too few arguments")]:
+                     ("BUY JNST 10",      "too few arguments"),
+                     # handout 2.1: quantity/price must lie in 1..2,147,483,647,
+                     # and an out-of-range order "must not be accepted or executed"
+                     ("BUY JNST 2147483648 238",  "quantity one past 2^31-1"),
+                     ("BUY JNST 10 2147483648",   "price one past 2^31-1"),
+                     ("SELL JNST 99999999999 5",  "quantity far out of range"),
+                     ("SELL IMCT 5 99999999999",  "price far out of range")]:
         bob.send(bad)
         check_error(f"rejected: {why}", bob.drain())
+
+    print("--- ...but the range bounds themselves are VALID (inclusive) ---")
+    bob.send("BUY JNST 2147483647 1")
+    check("max quantity accepted", bob.drain(), ["ORDER_ACCEPTED 7"])
+    bob.send("CANCEL 7"); bob.drain()
+    bob.send("BUY JNST 1 2147483647")
+    check("max price accepted",    bob.drain(), ["ORDER_ACCEPTED 8"])
+    bob.send("CANCEL 8"); bob.drain()
 
     print("--- handout 2.6: orders SURVIVE their owner's disconnect ---")
     dave = Client(); dave.send("LOGIN dave"); dave.drain()
     dave.send("BUY JNST 50 777"); dave.drain()
     dave.close(); time.sleep(0.5); md.drain()
     bob.send("SELL JNST 50 777")
-    check("counterparty still fills", bob.drain(), ["ORDER_ACCEPTED 8", "SOLD JNST 50 777"])
+    # ids 7 and 8 were consumed by the boundary-value orders above, so dave's
+    # order is 9 and this one is 10.
+    check("counterparty still fills", bob.drain(), ["ORDER_ACCEPTED 10", "SOLD JNST 50 777"])
     check("md still sees the TRADE",  md.drain(),  ["TRADE JNST 50 777"])
 finally:
     finish(server, 7)

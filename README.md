@@ -45,7 +45,14 @@ Market-data terminals will print `TRADE ...` lines automatically.
 
 ## Configuration / assumptions
 - Server binds the host+port given on the command line (loopback is fine).
-- Instruments supported: `JNST`, `IMCT`. All numbers are positive integers.
+- Instruments supported: `JNST`, `IMCT`.
+- Numeric ranges (handout 2.1): quantity and price are integers in
+  `1..2147483647`; order ids are `0..2147483647`. A `BUY`/`SELL` carrying a
+  value outside that range is answered with `ERROR` and is neither accepted
+  nor executed.
+- Orders outlive their owner's connection (handout 2.6): a disconnect does not
+  cancel resting orders. They can still match; the departed trader receives no
+  `BOUGHT`/`SOLD`, while subscribed Market-Data clients still receive `TRADE`.
 - Concurrency/I/O: single-threaded **kqueue** event loop (see `report.pdf`
   §Implementation Decisions).
 

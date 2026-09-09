@@ -1,9 +1,3 @@
-// ============================================================================
-// protocol.cpp  --  Implementations for protocol.hpp
-// These are pure string/number utilities: no sockets here. Get them correct and
-// unit-test them on the command line BEFORE you touch networking, because every
-// bug in framing/parsing looks like a "networking" bug once sockets are involved.
-// ============================================================================
 #include "protocol.hpp"
 #include <sstream>
 #include <cctype>
@@ -20,9 +14,6 @@ bool is_valid_instrument(const std::string& s) {
 }
 
 bool parse_nonnegative_int(const std::string& s, long long& out) {
-    // Strict per handout 2.1: digits only, no sign, no decimal point, no
-    // leading/trailing space. Anything else must become an ERROR response
-    // upstream, never a crash. 0 IS accepted here -- see the header for why.
     if (s.empty()) {
         return false;
     }
@@ -33,17 +24,18 @@ bool parse_nonnegative_int(const std::string& s, long long& out) {
             return false;
         }
     }
-    // from_chars reports overflow as result_out_of_range instead of wrapping.
     auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), out);
     if (ec != std::errc()) {
+        return false;
+    }
+    // Handout 2.1: values outside the stated range are not valid protocol values.
+    if (out > MAX_VALUE) {
         return false;
     }
     return true;
 }
 
 bool parse_positive_int(const std::string& s, long long& out) {
-    // Identical parsing, one extra rule: quantity and price must be > 0.
-    // Only "0" (or "000") can reach the check non-positive.
     if (!parse_nonnegative_int(s, out)) return false;
     return out > 0;
 }
@@ -56,10 +48,6 @@ std::vector<std::string> tokenize(const std::string& line) {
     return tok; // this one is done for you as a reference pattern.
 }
 
-// ---- message builders --------------------------------------------------------
-// Wire forms come straight from handout 2.3 (trader responses) and 2.5 (market
-// data). None of these append '\n' -- the newline is added exactly once at send
-// time so a line can never get double-framed.
 std::string msg_ok() { return "OK"; }
 
 std::string msg_error(const std::string& reason)       { return "ERROR " + reason; }

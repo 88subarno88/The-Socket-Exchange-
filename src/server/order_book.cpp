@@ -1,13 +1,3 @@
-// ============================================================================
-// order_book.cpp  --  Fill in the matching logic described in order_book.hpp.
-//
-// TESTING TIP: write a tiny main() in a throwaway file that drives OrderBook
-// directly (no sockets) and asserts on the Fills returned. Example scenario
-// straight from the handout (2.6):
-//     submit(BUY  JNST 100 238)  -> no fills, rests 100
-//     submit(SELL JNST  60 238)  -> 1 fill of 60 @238; buy has 40 left resting
-// Get this green before wiring the engine to the server.
-// ============================================================================
 #include "order_book.hpp"
 #include <algorithm>   // std::min
 
@@ -24,9 +14,6 @@ std::vector<Fill> OrderBook::submit(Order o) {
 
     InstrumentBook& ib = books_[o.instrument];
 
-    // Handout 2.6 matches ONLY at an exactly equal price, so the entire search
-    // is one lookup of the opposite side at this order's price. Same instrument
-    // is implied by `ib`; opposite side is implied by which map we picked.
     std::map<long long, std::deque<Order>>& opposite =
         (o.side == Side::BUY) ? ib.sells : ib.buys;
 
@@ -79,10 +66,6 @@ std::vector<Fill> OrderBook::submit(Order o) {
 
 bool OrderBook::cancel(long long order_id, int requester_fd,
                        unsigned long long requester_seq) {
-    // Order ids are unique for the server's lifetime, so the first match is THE
-    // order. Anything still in the book necessarily has qty > 0 (fully-filled
-    // orders are erased at match time), so "still has unfilled quantity" needs
-    // no separate check -- being present IS the check.
     for (auto& kv : books_) {
         InstrumentBook& ib = kv.second;
         for (std::map<long long, std::deque<Order>>* side : {&ib.buys, &ib.sells}) {
@@ -91,10 +74,6 @@ bool OrderBook::cancel(long long order_id, int requester_fd,
                 for (auto it = queue.begin(); it != queue.end(); ++it) {
                     if (it->id != order_id) continue;
 
-                    // Found it -- but you may only cancel your OWN order. The fd
-                    // alone is not enough: an order can outlive its owner
-                    // (handout 2.6) and a later client may be handed the same fd.
-                    // The session must match too.
                     if (it->owner_fd != requester_fd) return false;
                     if (it->owner_seq != requester_seq) return false;
 
@@ -111,8 +90,7 @@ bool OrderBook::cancel(long long order_id, int requester_fd,
 std::vector<long long> OrderBook::remove_orders_of(int owner_fd) {
     std::vector<long long> removed;
 
-    // A disconnected trader's resting orders must vanish, or later orders would
-    // "match" against a socket that no longer exists (handout 4.4).
+    // Not called on disconnect: handout 2.6 keeps such orders in the book.
     for (auto& kv : books_) {
         InstrumentBook& ib = kv.second;
         for (std::map<long long, std::deque<Order>>* side : {&ib.buys, &ib.sells}) {

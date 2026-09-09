@@ -1,7 +1,7 @@
 #!/bin/sh
 # Run every phase check (1-9). Inside the VM:  sh ~/A2_ROLL1_ROLL2/run_all.sh
 cd "$(dirname "$0")" || exit 1
-pkill -f exchange_server 2>/dev/null; pkill nc 2>/dev/null; sleep 1
+pkill -x exchange_server 2>/dev/null; pkill nc 2>/dev/null; sleep 1
 make > /tmp/build.log 2>&1 || { echo "BUILD FAILED"; tail -20 /tmp/build.log; exit 1; }
 echo "build OK"; echo
 pass=0; fail=0
@@ -12,7 +12,7 @@ run() {
     else
         echo "    FAIL  (see /tmp/phase$1.log)"; tail -6 /tmp/phase$1.log | sed 's/^/    /'; fail=$((fail+1))
     fi
-    pkill -f exchange_server 2>/dev/null; sleep 1
+    pkill -x exchange_server 2>/dev/null; sleep 1
 }
 run 1 "protocol helpers"      "c++ -std=c++17 -Wall -Wextra t1.cpp src/common/protocol.cpp -o /tmp/t1 && /tmp/t1"
 run 2 "LineBuffer framing"    "c++ -std=c++17 -Wall -Wextra t2.cpp src/common/net_utils.cpp -o /tmp/t2 && /tmp/t2"

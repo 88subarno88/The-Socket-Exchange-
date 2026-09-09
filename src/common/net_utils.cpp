@@ -1,10 +1,3 @@
-// ============================================================================
-// net_utils.cpp
-// send_all / set_nonblocking / LineBuffer are given as WORKING reference code
-// (with comments) because they are pure plumbing. make_listen_socket and
-// connect_to are left as GUIDED SKELETONS -- fill the syscalls yourself so you
-// can explain each one in the viva (viva = 20% of the grade).
-// ============================================================================
 #include "net_utils.hpp"
 
 #include <sys/types.h>
@@ -28,12 +21,6 @@ int set_nonblocking(int fd) {
     return 0;
 }
 
-// Fill a sockaddr_in from a dotted-quad host string and a port. Shared by the
-// listen and connect paths so the byte-order handling lives in exactly one place.
-// Returns 0 on success, -1 if `host` is not a valid IPv4 literal.
-//   NOTE: inet_pton takes a NUMERIC address only -- it does not resolve names.
-//   "localhost" therefore fails here on purpose; pass 127.0.0.1. Resolving names
-//   would mean getaddrinfo(), which the assignment does not need.
 static int fill_addr(const std::string& host, int port, struct sockaddr_in& addr) {
     memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;
@@ -96,10 +83,6 @@ int connect_to(const std::string& host, int port) {
     struct sockaddr_in addr;
     if (fill_addr(host, port, addr) < 0) { close(fd); return -1; }
 
-    // 3) connect(): performs the TCP three-way handshake. On a BLOCKING fd this
-    //    returns only once the connection is ESTABLISHED (or has failed).
-    //    (The bonus generator wants a non-blocking variant so thousands of
-    //     handshakes can be in flight at once -- that one gets EINPROGRESS here.)
     if (connect(fd, (struct sockaddr*)&addr, sizeof addr) < 0) {
         perror("connect");
         close(fd);

@@ -11,7 +11,7 @@ set -u
 PORT=${PORT:-5000}
 cd "$(dirname "$0")" || exit 1
 
-pkill -f exchange_server 2>/dev/null
+pkill -x exchange_server 2>/dev/null
 pkill nc 2>/dev/null
 sleep 1
 

@@ -1,22 +1,3 @@
-// ============================================================================
-// market_data_client.cpp  --  Market-Data Client (handout 3.2, read-only).
-//
-// This client SUBSCRIBEs to one or more instruments and then mostly just
-// listens: the server pushes TRADE updates whenever a matching trade happens
-// (handout 2.5). It never sends BUY/SELL/CANCEL -- if it does, the server must
-// answer ERROR (role enforcement). It may still type SUBSCRIBE/UNSUBSCRIBE/QUIT,
-// so we use the same poll(stdin, sock) structure as the trader.
-//
-// EXPERIMENT 7 NOTE (slow receiver): to *play* the slow client you deliberately
-// stop calling recv() for a while (e.g. sleep between reads). Don't build that
-// into the normal client -- the experiment.py harness / a flag will drive it.
-// For normal operation, drain the socket promptly.
-//
-// USAGE (via client/run-market-data): ./market_data_client <host> <port> [INSTR...]
-//   Any instruments passed on the command line are auto-subscribed on connect,
-//   e.g.  ./market_data_client 127.0.0.1 5000 JNST IMCT
-// ============================================================================
-
 #include "../common/net_utils.hpp"
 #include "../common/protocol.hpp"
 #include <sys/socket.h>   // recv/send/shutdown
@@ -38,9 +19,6 @@ int main(int argc, char** argv) {
     int fd = net::connect_to(host, port);
     if (fd < 0) return 1;
 
-    // Auto-subscribe to every instrument given on the command line (handout 2.4).
-    // We deliberately do NOT validate here -- rejecting a bad instrument is the
-    // server's job, and letting it through is how we can test that it does.
     for (int i = 3; i < argc; i++) {
         if (net::send_line(fd, std::string("SUBSCRIBE ") + argv[i] + "\n") < 0) {
             close(fd);
@@ -92,9 +70,6 @@ int main(int argc, char** argv) {
             }
         }
 
-        // ---- server pushed something ----------------------------------------
-        // Note this client mostly sits here: after SUBSCRIBE it sends nothing,
-        // yet TRADE updates keep arriving (handout 2.5 -- one-to-many push).
         if (pfds[1].revents & (POLLIN | POLLHUP | POLLERR)) {
             char buf[4096];
             ssize_t n = recv(fd, buf, sizeof buf, 0);
