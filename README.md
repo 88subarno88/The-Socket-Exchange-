@@ -4,7 +4,6 @@ TCP-based simulated trading system: one Exchange Server, many Trader and
 Market-Data clients, all over raw POSIX sockets. Built and tested on
 **FreeBSD 14.4-RELEASE**.
 
-Team: **Rohit Meena** (2024CS10030), **Subarno Saha** (2024CS50431)
 
 ## Language / toolchain
 - Language: **C++17**
