@@ -1,0 +1,1038 @@
+% ===========================================================================
+% COL334 Assignment 2 -- The Socket Exchange
+% Experiment Report (handout section 8) + Bonus (handout section 6.9)
+%
+% Build:  pdflatex report.tex   (run twice for the table of contents)
+% ===========================================================================
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{fancyvrb}
+\usepackage[hidelinks]{hyperref}
+\usepackage{caption}
+
+\captionsetup{font=small,labelfont=bf}
+\setlength{\parskip}{0.5em}
+\setlength{\parindent}{0pt}
+
+\newcommand{\shot}[2]{%
+  \begin{figure}[htbp]
+    \centering
+    \fbox{\includegraphics[width=\textwidth]{#1}}
+    \caption{#2}
+  \end{figure}%
+}
+
+\newcommand{\cmd}[1]{\texttt{\small #1}}
+
+\title{\textbf{The Socket Exchange}\\[0.3em]
+       \large COL334 --- Assignment 2 --- Experiment Report}
+\author{Rohit Meena (2024CS10030) \quad\textbullet\quad Subarno Saha (2024CS50431)}
+\date{FreeBSD 14.4-RELEASE \quad\textbullet\quad C++17 \quad\textbullet\quad \today}
+
+\begin{document}
+\maketitle
+
+All experiments were run on FreeBSD 14.4-RELEASE. The Exchange Server is written
+in C++17 against the POSIX socket API with \cmd{kqueue()}; no third-party
+networking library is used. Every measurement below was taken on the running
+system with the FreeBSD tools named in each section.
+
+\tableofcontents
+\newpage
+
+% ===========================================================================
+\section{Implementation Decisions}
+% ===========================================================================
+
+\subsection{Concurrency / I/O approach}
+
+The Exchange Server is a \textbf{single-threaded event loop built on
+\cmd{kqueue()}}. There is one process and one thread for the entire server. The
+listening socket and every accepted connection are registered on a single kqueue
+with \cmd{EVFILT\_READ}; \cmd{kevent()} blocks until the kernel reports
+descriptors ready, and the loop services only those.
+
+This is verifiable from outside the process. \cmd{procstat -f} shows the server
+holding the listening socket on fd~3, \textbf{the kqueue itself on fd~4}
+(descriptor type \cmd{k}), and one socket fd per connection thereafter
+(Figures~\ref{fig:e1b} and~\ref{fig:e5b}). \cmd{procstat -k} shows exactly one
+thread, asleep inside \cmd{sys\_kevent}:
+
+\begin{Verbatim}[fontsize=\small,frame=single]
+mi_switch sleepq_catch_signals sleepq_wait_sig _sleep kqueue_scan
+kqueue_kevent kern_kevent_fp kern_kevent_generic sys_kevent
+amd64_syscall fast_syscall_common
+\end{Verbatim}
+
+\subsection{Why this approach}
+
+\textbf{Cost scales with activity, not with connection count.} \cmd{kevent()}
+returns only descriptors the kernel has already marked ready, so a loop
+iteration costs $O(\mathrm{ready})$ rather than $O(\mathrm{open})$. Experiment~5
+shows this directly: with five connections open and only three carrying data,
+the server called \cmd{recv()} on exactly those three and never touched the
+other two.
+
+\textbf{One unresponsive client cannot stall the others.} Because the loop
+blocks in \cmd{kevent()} rather than in \cmd{recv()} on a particular socket, a
+client that connects and then sends a partial message is simply never reported
+ready. Experiment~4 measured a second client being served in
+0.001\,s while the first held an unterminated message, with
+\cmd{procstat -k} confirming the server was parked in \cmd{sys\_kevent} and not
+in \cmd{soreceive}.
+
+\textbf{Per-connection cost is tiny, which is what makes the bonus possible.}
+Measured across seven levels, server resident memory grows by
+$\approx$\,2012\,KB per 10{,}000 idle connections --- about
+\textbf{201 bytes per connection} --- on a 3.4\,MB baseline. Holding
+70{,}000 idle connections cost 17.1\,MB of RSS and 0.1\% CPU.
+
+\textbf{The alternatives are worse.} A thread per connection would need 70{,}000
+stacks; even at a conservative 512\,KB each that is
+$\approx$\,34\,GB against 4\,GB of RAM, roughly four
+orders of magnitude more than the measured 201~bytes. \cmd{select()} is bounded
+by \cmd{FD\_SETSIZE} (1024 by default) and so cannot reach these numbers at all.
+\cmd{poll()} has no such cap but requires passing and scanning the whole
+descriptor array on every call --- $O(n)$ in the number of \emph{open}
+descriptors, i.e.\ 70{,}000 entries examined to find the few that are ready.
+
+\subsection{Other significant design decisions}
+
+\textbf{All sockets are non-blocking.} \cmd{set\_nonblocking()} is applied to
+every descriptor returned by \cmd{accept()}. This is mandatory rather than
+optional: in a readiness-based loop a single blocking \cmd{recv()} or
+\cmd{send()} would stall every other client, which is exactly the failure
+Experiment~4 tests for.
+
+\textbf{Message framing is explicit, because TCP provides none.} Each connection
+owns a \cmd{LineBuffer} that accumulates bytes from \cmd{recv()} and yields
+complete \verb|\n|-terminated lines. One \cmd{recv()} is never assumed to equal
+one message. Experiment~3 demonstrates why: a single 24-byte message sent in
+four writes arrived as four separate \cmd{recv()} calls of 6, 10, 7 and 1 bytes,
+and the server produced no command until the final newline arrived. On the
+output side the \verb|\n| is appended in exactly one place (\cmd{enqueue()}), so
+a line can never be double-framed.
+
+\textbf{Backpressure is handled per connection, so a slow reader is contained.}
+\cmd{enqueue()} first attempts \cmd{send()} directly. If the peer's receive
+window is full, \cmd{send()} returns \cmd{EAGAIN} --- treated as backpressure,
+not as an error --- and the unsent remainder is appended to that connection's
+own \cmd{outbuf} queue, with \cmd{EVFILT\_WRITE} registered for that socket
+only. When the socket becomes writable the queue is drained and the filter is
+removed again. Consequently a client that stops reading backs up on its own
+socket alone. Experiment~7 confirms this: with one market-data client
+deliberately not reading, its receive queue grew to 85{,}000 bytes while the
+normal client stayed at 17~bytes and both traders completed all 5{,}000 trades.
+
+\textbf{The accept loop drains fully.} A single \cmd{EVFILT\_READ} on the
+listening socket can represent several queued connections, so \cmd{accept()} is
+called in a loop until it returns \cmd{EAGAIN}. Without this the server would
+fall behind under burst load --- which matters at the connection rates used in
+the bonus.
+
+\textbf{Connection teardown is idempotent.} \cmd{close\_session()} returns
+immediately if the session is already gone, and \cmd{EV\_EOF} is acted on only
+after \cmd{on\_readable()} has run, so a descriptor is never closed twice.
+\cmd{recv()} returning 0 (FIN) and \cmd{recv()} failing with \cmd{ECONNRESET}
+(RST) are logged distinctly, which is what made Experiments~6 and~8 measurable
+from the application side.
+
+\textbf{Roles are inferred from the first command.} A connection is
+\cmd{UNKNOWN} until it issues a command; \cmd{LOGIN}/\cmd{BUY}/\cmd{SELL}/%
+\cmd{CANCEL} make it a Trader, \cmd{SUBSCRIBE}/\cmd{UNSUBSCRIBE} a Market-Data
+client. A command outside the connection's role is answered with \cmd{ERROR},
+which is what makes a Market-Data connection genuinely read-only.
+
+\textbf{Resting orders outlive their owner's connection} (handout 2.6).
+\cmd{close\_session()} deliberately does \emph{not} remove the departing
+client's orders; they remain in the book and can still match. Subscribed
+Market-Data clients still receive the resulting \cmd{TRADE} messages, while the
+departed trader receives no \cmd{BOUGHT}/\cmd{SOLD}.
+
+\textbf{A generation counter guards against descriptor reuse.} Every session
+carries a monotonically increasing \cmd{session\_seq}, recorded on each order.
+Before delivering a fill the server checks that the descriptor's \emph{current}
+session sequence still matches the one that submitted the order. Without this, a
+fill belonging to a departed trader could be delivered to whichever new client
+happened to inherit that file descriptor number --- a real hazard given how
+aggressively descriptors are recycled.
+
+\newpage
+% ===========================================================================
+\section{Experiments}
+% ===========================================================================
+
+% ---------------------------------------------------------------------------
+\subsection{Experiment 1 --- Listening and Connected Sockets}
+
+\textbf{Question.} After the client has connected, identify the TCP sockets
+associated with the Exchange Server. How does the listening socket differ from
+the socket representing the connection to the client?
+
+\textbf{Answer.} The server holds \textbf{two distinct TCP sockets on two
+distinct file descriptors}. Fd~3 is the \emph{listening} socket: bound to the
+local half-association \cmd{127.0.0.1:5000} only, with a wildcard foreign
+address \cmd{*:*}, in state \cmd{LISTEN}. It carries no peer and no data and
+exists solely to be \cmd{accept()}ed from. Fd~5 is the \emph{connected} socket
+returned by that \cmd{accept()}: fully specified by the four-tuple
+\cmd{127.0.0.1:5000 $\leftrightarrow$ 127.0.0.1:51080}, in state
+\cmd{ESTABLISHED}, and the only one of the two over which bytes flow. Both share
+local port 5000; it is the \emph{remote} endpoint that distinguishes them, which
+is precisely why one listening port can fan out to many simultaneous
+connections.
+
+\textbf{Approach.} Ran the harness so the server was listening with exactly one
+client attached, then inspected the same instant from two angles: the
+system-wide socket table (which addresses and states exist) and the server
+process's own descriptor table (which fds those sockets occupy inside the
+process).
+
+\textbf{Commands and tools.}
+\begin{Verbatim}[fontsize=\small,frame=single]
+sockstat -4l | grep 5000                    # baseline: port free before start
+sockstat -4  | grep -E 'USER|exchange|5000' # server sockets by process and fd
+netstat -an -p tcp | grep -E 'Proto|5000'   # addresses and TCP states
+procstat -f $(pgrep -x exchange_server)     # the server's fd table
+\end{Verbatim}
+
+\textbf{Evidence.} \cmd{sockstat} shows fd~3 $\rightarrow$ \cmd{*:*} and fd~5
+$\rightarrow$ \cmd{127.0.0.1:51080}. \cmd{netstat} shows one \cmd{LISTEN} row
+and \emph{two} \cmd{ESTABLISHED} rows (both directions of the loopback pair).
+\cmd{procstat -f} additionally shows fd~4 of type \cmd{k} --- the kqueue.
+Recv-Q and Send-Q are 0 on every row: an idle connection buffers nothing.
+
+\shot{/home/vzux/Desktop/A2_evidence/exp1/exp1_listen-vs-established.png}
+{Experiment 1 --- baseline showing the port free, then \texttt{sockstat} and
+\texttt{netstat} with the \texttt{LISTEN} socket (\texttt{*:*}) and both
+\texttt{ESTABLISHED} rows of the loopback pair.}
+
+\shot{/home/vzux/Desktop/A2_evidence/exp1/exp1_server-fds.png}
+{Experiment 1 --- \texttt{procstat -f}: fd~3 listening socket, \textbf{fd~4 the
+kqueue} (type \texttt{k}), fd~5 the connected socket. One process holds all
+three.}
+\label{fig:e1b}
+
+\newpage
+% ---------------------------------------------------------------------------
+\subsection{Experiment 2 --- Observing TCP Connection States}
+
+\textbf{Question.} How does the TCP state of the client--server connection
+change during its lifetime, and what events cause the observed state changes?
+
+\textbf{Answer.}
+
+\emph{Establishment.} \cmd{connect()} sends SYN; the server replies SYN+ACK; the
+client ACKs. Both endpoints reach \cmd{ESTABLISHED}. On loopback this took
+20\,$\mu$s (SYN at 06:14:20.569648, final ACK at .569668), so
+\cmd{SYN\_SENT} and \cmd{SYN\_RCVD} never appear in a 1-second \cmd{netstat}
+sample --- they exist only in the packet capture.
+
+\emph{Active phase.} Both rows remain \cmd{ESTABLISHED} with
+Recv-Q~=~Send-Q~=~0 for the full 10-second idle window.
+
+\emph{Termination.} The client closes first, sending FIN at 06:14:30.658923. The
+server ACKs it and its \cmd{recv()} returns 0 --- logged as
+\cmd{[5] recv() -> 0 : peer closed (FIN)} --- whereupon the event loop closes
+the socket, emitting the server's own FIN at .659202, which the client ACKs.
+
+\emph{The critical timing result.} The gap between the two FINs is
+\textbf{279\,$\mu$s} (Pass~A) and 143\,$\mu$s (Pass~B).
+That interval \emph{is} the server's \cmd{CLOSE\_WAIT} and the client's
+\cmd{FIN\_WAIT\_2} state. Both are real but last only microseconds, because the
+event loop reacts to \cmd{recv()==0} immediately. Their absence from
+\cmd{netstat} is a sampling artefact, not an absence of the states.
+
+\emph{\cmd{TIME\_WAIT} and the loopback special case.} This guest has
+\cmd{net.inet.tcp.nolocaltimewait = 1}, so FreeBSD deliberately skips
+\cmd{TIME\_WAIT} when both endpoints are local. Hence in Pass~A the two rows
+simply vanish at 06:14:31, leaving only \cmd{LISTEN}. Setting the sysctl to 0
+(Pass~B) restores standard behaviour: the closing side enters \cmd{TIME\_WAIT}
+at 06:36:41 and holds it through 06:37:40, disappearing at 06:37:41 ---
+\textbf{exactly 60\,s $= 2 \times$ MSL}, with \cmd{net.inet.tcp.msl = 30000}\,ms.
+
+\emph{\cmd{TIME\_WAIT} is kernel state, not process state.} The harness stopped
+the server 15\,s after the close: the \cmd{LISTEN} row is present at 06:36:56 and
+gone at 06:36:57, yet \cmd{TIME\_WAIT} survives a further \textbf{44 seconds}, to
+06:37:40. The four-tuple is held by the kernel long after the owning process has
+exited --- which is the purpose of \cmd{TIME\_WAIT}: preventing a delayed
+duplicate segment from being delivered to a new connection reusing that
+four-tuple. The contrast is direct: in Pass~A the \cmd{LISTEN} row dies
+\emph{with} the process and nothing outlives it.
+
+\emph{Incidental observation.} The harness's readiness probe reaches port 5000
+before the server has bound, at 06:14:20.462364, and its SYN is answered
+32\,$\mu$s later by RST --- connection refused. A SYN to a port with
+no listener produces RST, never FIN. This is reused in Experiment~6.
+
+\textbf{Approach.} Ran the experiment twice with three terminals running
+concurrently: a packet capture started first, a 1-second \cmd{netstat} sampler
+second, the harness last. Pass~A used the guest default; Pass~B set
+\cmd{nolocaltimewait=0} to expose \cmd{TIME\_WAIT}, and the sampler was
+deliberately left running past the end of the harness so the \cmd{TIME\_WAIT}
+lifetime could be measured against the disappearance of the \cmd{LISTEN} row.
+
+\textbf{Commands and tools.}
+\begin{Verbatim}[fontsize=\small,frame=single]
+su root -c 'tcpdump -l -i lo0 -n -tttt "tcp port 5000"' | tee exp2A_tcpdump.txt
+while true; do date +%T; netstat -an -p tcp | grep 5000; echo; sleep 1; done \
+    | tee exp2A_states.txt
+python3 -u experiment.py 2 2>&1 | tee exp2A_harness.txt
+su root -c 'sysctl net.inet.tcp.nolocaltimewait=0'   # Pass B; restored to 1 after
+sysctl net.inet.tcp.msl                              # = 30000 ms
+\end{Verbatim}
+The \cmd{-l} flag is essential: without it \cmd{tcpdump} block-buffers into the
+pipe and prints nothing until it exits.
+
+\shot{/home/vzux/Desktop/A2_evidence/exp2/exp2_A-established.png}
+{Experiment 2, Pass A --- steady \texttt{ESTABLISHED} (both directions) plus
+\texttt{LISTEN}, 06:14:20--24.}
+
+\shot{/home/vzux/Desktop/A2_evidence/exp2/exp2_A-after-close.png}
+{Experiment 2, Pass A --- the transition. \texttt{ESTABLISHED} at 06:14:28 and
+:30; at 06:14:31 both rows have vanished with \textbf{no} \texttt{TIME\_WAIT},
+because \texttt{nolocaltimewait=1} skips it on loopback.}
+
+\shot{/home/vzux/Desktop/A2_evidence/exp2/exp2_A-tcpdump-fin.png}
+{Experiment 2, Pass A --- the complete 13-packet capture: the connection-refused
+RST, the three-way handshake, and the four-way FIN close.}
+
+\shot{/home/vzux/Desktop/A2_evidence/exp2/exp2_A-listen-dies-with-process.png}
+{Experiment 2, Pass A --- \texttt{LISTEN} persists to 06:14:44 and disappears at
+:45 when the server process exits. Nothing outlives the process.}
+
+\shot{/home/vzux/Desktop/A2_evidence/exp2/exp2_B-sysctl-flipped.png}
+{Experiment 2, Pass B --- \texttt{net.inet.tcp.nolocaltimewait: 1 -> 0}.}
+
+\shot{/home/vzux/Desktop/A2_evidence/exp2/exp2_B-time-wait-outlives-process.png}
+{Experiment 2, Pass B --- the key result. At 06:36:56 both \texttt{TIME\_WAIT}
+and \texttt{LISTEN} are present; at 06:36:57 \texttt{LISTEN} is gone (the server
+process has exited) yet \texttt{TIME\_WAIT} continues.}
+
+\shot{/home/vzux/Desktop/A2_evidence/exp2/exp2_B-time-wait-expires-60s.png}
+{Experiment 2, Pass B --- last \texttt{TIME\_WAIT} sample at 06:37:40, gone at
+06:37:41: exactly 60\,s $=2\times$MSL after the close at 06:36:41.}
+
+\shot{/home/vzux/Desktop/A2_evidence/exp2/exp2_B-harness-server-log.png}
+{Experiment 2, Pass B --- server trace: accept, \texttt{recv() -> 0 : peer
+closed (FIN)}, close.}
+
+\newpage
+% ---------------------------------------------------------------------------
+\subsection{Experiment 3 --- TCP as a Byte Stream}
+
+\textbf{Question.} Does the Exchange Server receive the application-level
+message as one complete unit, or can it be received in multiple pieces? What
+does this demonstrate about TCP and application-level message boundaries?
+
+\textbf{Answer.} \textbf{In multiple pieces.} The single message
+\cmd{LOGIN experiment\_trader\textbackslash n} (24 bytes) was written by the
+client as four separate \cmd{send()} calls and arrived as \textbf{four separate
+\cmd{recv()} calls returning 6, 10, 7 and 1 bytes} --- never as one 24-byte
+unit. The server could act on none of them until the fourth delivered the
+terminating newline, at which point it emitted
+\cmd{[5] LOGIN experiment\_trader}.
+
+This demonstrates that TCP is a \emph{byte stream}, not a message stream. It
+guarantees that bytes arrive in order and without loss, but preserves no record
+of where the sender's writes began or ended. Application-level message
+boundaries do not exist at the transport layer, so the application must impose
+them --- here by buffering and splitting on \verb|\n|. The converse also holds:
+had the pieces arrived close enough together they would have coalesced into one
+\cmd{recv()}, and several messages can equally arrive in one \cmd{recv()}.
+Either way the receiver cannot assume one \cmd{recv()} equals one message, which
+is why the \cmd{LineBuffer} accumulator is required rather than optional.
+
+\textbf{Approach.} Observed the same event from both sides simultaneously: the
+server's own instrumentation logging the return value of every \cmd{recv()}, and
+a packet capture with ASCII payload decoding to confirm what actually crossed
+the wire. Cross-checking the two rules out the possibility that the split was an
+artefact of the logging rather than of TCP.
+
+\textbf{Commands and tools.}
+\begin{Verbatim}[fontsize=\small,frame=single]
+su root -c 'tcpdump -l -i lo0 -n -tttt -A "tcp port 5000"' | tee exp3_tcpdump.txt
+python3 -u experiment.py 3 2>&1 | tee exp3_harness.txt
+\end{Verbatim}
+\cmd{-A} prints payload as ASCII. The server logs each \cmd{recv()} return value
+at \cmd{exchange\_server.cpp:365}; handout 6.3 explicitly permits modifying the
+implementation to make this observable.
+
+\textbf{Evidence.} Four \cmd{[P.]} segments from \cmd{127.0.0.1:28206}, with
+\emph{contiguous} sequence numbers --- TCP delivered one unbroken 24-byte stream;
+the segmentation reflects the sender's write pattern, not the message:
+
+\begin{center}\small
+\begin{tabular}{llrl}
+\toprule
+Time & Seq range & Length & Payload \\
+\midrule
+15:59:02.821997 & 1:7   & 6  & \cmd{"LOGIN "} \\
+15:59:03.030565 & 7:17  & 10 & \cmd{"experiment"} \\
+15:59:03.241641 & 17:24 & 7  & \cmd{"\_trader"} \\
+15:59:03.451747 & 24:25 & 1  & \verb|"\n"| \\
+15:59:03.452274 & \multicolumn{2}{l}{server $\rightarrow$ client, 3} & \cmd{"OK"} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The server's \cmd{OK} left 527\,$\mu$s after the newline arrived,
+confirming it was waiting for the delimiter and not for a message.
+
+\shot{/home/vzux/Desktop/A2_evidence/exp3/exp3_recv-sizes-one-message.png}
+{Experiment 3 --- four \texttt{recv()} calls returning 6, 10, 7 and 1 bytes, and
+the single parsed \texttt{LOGIN} line emitted only after the fourth.}
+
+\shot{/home/vzux/Desktop/A2_evidence/exp3/exp3_four-segments-one-message.png}
+{Experiment 3 --- the wire view: four \texttt{[P.]} segments with contiguous
+sequence numbers and readable ASCII payloads, then the server's \texttt{OK}.}
+
+\newpage
+% ---------------------------------------------------------------------------
+\subsection{Experiment 4 --- One Client Should Not Stall the Others}
+
+\textbf{Question.} When Client~1 remains connected but sends no data, can the
+Exchange Server still accept and service Client~2? Identify the server operation
+that determines the answer.
+
+\textbf{Answer.} \textbf{Yes.} Client~2 connected, sent
+\cmd{LOGIN active\_client\textbackslash n} and received \cmd{OK} in
+\textbf{0.001\,s} while Client~1 was still holding an unterminated
+message.
+
+The operation that decides this is the server's blocking call: it blocks in
+\cmd{kevent()} waiting for \emph{readiness across all registered descriptors},
+not in \cmd{recv()} on any one socket. \cmd{procstat -k} proves it --- the only
+thread's kernel stack is \cmd{\dots\ \_sleep kqueue\_scan kqueue\_kevent
+kern\_kevent\_fp kern\_kevent\_generic sys\_kevent \dots}. The server \emph{is}
+asleep, but inside \cmd{sys\_kevent}. There is no \cmd{soreceive}, no
+\cmd{recv}, nothing tied to Client~1's socket anywhere in the stack. When
+Client~2's data arrives the kernel makes fd~6 ready, \cmd{kevent()} returns it,
+and the loop services it without revisiting fd~5.
+
+A blocking server that called \cmd{recv(fd5)} in a fixed order would instead be
+parked in \cmd{soreceive} on fd~5 indefinitely, and Client~2 would never be
+accepted --- precisely the stall this design avoids.
+
+\textbf{Where the incompleteness lives.} Client~1's Recv-Q is \textbf{0, not
+20}. The server already performed \cmd{recv()} on fd~5 and received all 20 bytes
+(\cmd{[5] recv() -> 20 byte(s)}); they sit in that connection's application-level
+\cmd{LineBuffer} awaiting a newline that never comes, so no command line is ever
+emitted for fd~5. The kernel socket is drained and quiescent. The partial
+message is therefore an \emph{application-layer} state, not a TCP-layer one:
+TCP has delivered everything sent and has nothing outstanding.
+
+\textbf{Approach.} Ran the harness, which makes Client~1 send a message with no
+terminator and then fall silent, and Client~2 send a complete message
+$\approx$2\,s later. Measured the latency the harness reports for Client~2's
+reply, then --- while both connections were still open --- inspected the server
+from outside: its kernel stack, the socket table, and its descriptor table.
+
+\textbf{Commands and tools.}
+\begin{Verbatim}[fontsize=\small,frame=single]
+python3 -u experiment.py 4 2>&1 | tee exp4_harness.txt
+SRV=$(pgrep -x exchange_server); procstat -k $SRV | tee exp4_kstack.txt
+netstat -an -p tcp | grep -E 'Proto|5000'  | tee exp4_netstat.txt
+sockstat -4 | grep -E 'USER|exchange'      | tee exp4_sockstat.txt
+\end{Verbatim}
+\cmd{procstat -k} prints the in-kernel call stack of every thread; this is what
+identifies the blocking operation, which timing alone cannot.
+
+\shot{/home/vzux/Desktop/A2_evidence/exp4/exp4_client2-not-stalled.png}
+{Experiment 4 --- \texttt{[5] recv() -> 20 byte(s)} with \emph{no} parsed line
+following it (Client~1), versus \texttt{[6] recv() -> 20} $\rightarrow$
+\texttt{LOGIN active\_client} $\rightarrow$ \texttt{OK} in 0.001\,s (Client~2).}
+
+\shot{/home/vzux/Desktop/A2_evidence/exp4/exp4_procstat-kqueue-not-recv.png}
+{Experiment 4 --- the decisive evidence. \texttt{procstat -k} shows the single
+thread asleep in \texttt{sys\_kevent}, not in \texttt{soreceive}. Both
+connections \texttt{ESTABLISHED} with Recv-Q~0; \texttt{sockstat} shows fds
+3/5/6 on one PID.}
+
+\newpage
+% ---------------------------------------------------------------------------
+\subsection{Experiment 5 --- Multiple Clients and I/O Multiplexing}
+\emph{(optional experiment)}
+
+\textbf{Question.} At a particular point during the experiment, which client
+connections are actually ready for the server to service, and what evidence from
+the running system allows you to determine this?
+
+\textbf{Answer.} Only the connections carrying inbound data were ready:
+Client~1 (fd~5, port 65198), Client~3 (fd~7, port 42987) and Client~5 (fd~9,
+port 42493). Clients~2 (fd~6) and~4 (fd~8) were fully \cmd{ESTABLISHED} but had
+sent nothing, so kqueue never reported them and the server never touched them.
+
+\textbf{Three independent lines of evidence establish this.}
+
+\emph{1. The server's own trace.} The log contains \cmd{recv()} lines for fd~5,
+fd~7 and fd~9 only --- 15 bytes each, each followed by the parsed \cmd{LOGIN}.
+There is \textbf{no \cmd{[6]} or \cmd{[8]} line anywhere}. The server did not
+call \cmd{recv()} on the idle sockets and get \cmd{EAGAIN}; it never called
+\cmd{recv()} on them at all. Readiness, not polling, decides what is serviced.
+
+\emph{2. \cmd{netstat} distinguishes them independently.} On the client side of
+each connection the three active clients show \textbf{Recv-Q~=~3} --- the
+server's 3-byte \cmd{OK} reply sitting unread --- while the two idle clients
+show Recv-Q~=~0 in both directions. Even without the server's log, the socket
+table alone identifies which connections saw application traffic.
+
+\emph{3. \cmd{procstat} shows the structural cost.} \cmd{procstat -f} lists one
+process holding fd~3 (listening), fd~4 (the kqueue) and fds~5--9 (the five
+connections). \cmd{procstat -k} shows exactly \textbf{one thread}, asleep in
+\cmd{kqueue\_scan}\,/\,\cmd{sys\_kevent}.
+
+The mechanism: all five sockets are registered with \cmd{EVFILT\_READ} on the
+same kqueue, and \cmd{kevent()} returns only descriptors the kernel has marked
+ready. The loop's work is proportional to the number of \emph{active}
+connections, not \emph{open} ones. Idle connections cost a descriptor and some
+kernel socket state, but no CPU --- the property that makes the bonus tractable.
+
+\textbf{Approach.} Ran the harness, which opens five connections and then
+has clients 1, 3 and 5 send a \cmd{LOGIN} 0.5\,s apart while 2 and 4 stay
+silent. During the 15-second observation window, captured three views of the
+live server: the socket table, its file-descriptor table, and its thread kernel
+stacks. Cross-referenced the fd numbers in the server's accept log against the
+ports in \cmd{netstat} to attribute each socket to a specific client.
+
+\textbf{Commands and tools.}
+\begin{Verbatim}[fontsize=\small,frame=single]
+python3 -u experiment.py 5 2>&1 | tee exp5_harness.txt
+netstat -an -p tcp | grep -E 'Proto|5000' | tee exp5_netstat.txt
+procstat -f $(pgrep -x exchange_server)   | tee exp5_fds.txt
+procstat -k $(pgrep -x exchange_server)   | tee exp5_kstack.txt
+\end{Verbatim}
+
+\shot{/home/vzux/Desktop/A2_evidence/exp5/exp5_only-active-clients-serviced.png}
+{Experiment 5 --- five \texttt{accepted fd=} lines mapping fd to port, then
+\texttt{recv()}/\texttt{LOGIN} for clients 1, 3 and 5 and \textbf{no}
+\texttt{[6]} or \texttt{[8]} lines at all.}
+
+\shot{/home/vzux/Desktop/A2_evidence/exp5/exp5_five-conns-one-thread.png}
+{Experiment 5 --- \texttt{netstat} (Recv-Q~3 on the three active clients versus
+0 on the idle two), \texttt{procstat -f} (fd~3 listen, fd~4 kqueue, fds~5--9
+connections on one PID), and \texttt{procstat -k} (one thread in
+\texttt{sys\_kevent}).}
+\label{fig:e5b}
+
+\newpage
+% ---------------------------------------------------------------------------
+\subsection{Experiment 6 --- FIN vs.\ RST}
+
+\textbf{Question.} How does an abrupt client termination differ from the orderly
+shutdown? Identify the TCP event observed on the network and the corresponding
+behaviour of the Exchange Server's socket.
+
+\textbf{Answer.} The two differ in both what crosses the wire and what the
+server's socket reports, and the difference is \emph{negotiated} versus
+\emph{unilateral}.
+
+\emph{Orderly (Part A, client 127.0.0.1:33130) --- 7 packets.} The client calls
+\cmd{shutdown()} on its sending direction, putting a FIN on the wire. The close
+is a negotiated four-packet exchange: client FIN \cmd{[F.]} $\rightarrow$ server
+ACK \cmd{[.]} $\rightarrow$ server FIN \cmd{[F.]} $\rightarrow$ client ACK
+\cmd{[.]}. Each FIN consumes a sequence number and is acknowledged. On the
+server the FIN surfaces as \textbf{\cmd{recv()} returning 0} --- a normal
+end-of-stream, not an error --- logged as
+\cmd{[5] recv() -> 0 : peer closed (FIN)}. The server then closes its own side,
+emitting its FIN 142\,$\mu$s later.
+
+\emph{Abortive (Part B, client 127.0.0.1:25854) --- 4 packets.} The client sets
+\cmd{SO\_LINGER} with a zero timeout and closes, which makes the kernel send RST
+instead of FIN. This is unilateral: \textbf{a single \cmd{[R.]} packet, never
+acknowledged}, with no reply from the server and no further exchange of any
+kind. On the server the reset surfaces as \textbf{\cmd{recv()} failing with
+\cmd{ECONNRESET}}, logged as
+\cmd{[5] recv() -> ECONNRESET : peer reset (RST)}. Any queued outbound data
+would be discarded rather than delivered, and a subsequent \cmd{send()} would
+fail with \cmd{EPIPE}.
+
+So the distinguishing TCP event is the flag itself --- FIN versus RST --- and the
+corresponding socket behaviour is \cmd{recv()}~$=$~0 (orderly EOF) versus
+\cmd{recv()}~$=$~$-1$ with \cmd{ECONNRESET} (error). The packet counts, 7
+versus 4, quantify it: RST needs no acknowledgement and no second direction,
+which is exactly why it is ``abrupt''.
+
+\textbf{RST arises from two distinct causes in this capture.} At 16:17:20.509266
+the server side sends \cmd{[R.]} in reply to a SYN on port 5000 \emph{before the
+server had bound}: a SYN to a port with no listener is answered with RST
+(connection refused), never with FIN. That is a different cause from Part~B's
+deliberate abortive close at .678706, yet both produce the same single
+unacknowledged reset packet. A third RST at .610374 is the harness's readiness
+probe closing abortively after confirming the server was up. Only .678706 is the
+experiment's own Part~B reset.
+
+\textbf{Note on \cmd{netstat} versus the capture.} The 1-second sampler never
+caught \cmd{ESTABLISHED} for Part~A at all --- the client shut down
+274\,$\mu$s after connecting, far below the sampling interval. What
+the sampler \emph{did} show is the client socket sitting in state \cmd{CLOSED}
+from 16:17:21 to 16:17:29, disappearing at 16:17:30. The TCP connection was
+fully torn down at .611, but the harness had not yet called \cmd{close()} on the
+file descriptor, so the socket still existed --- separating TCP \emph{connection}
+state from \emph{socket/fd} lifetime. (This is not itself a FIN-versus-RST
+difference: Part~B's fd was closed immediately, so the two are not directly
+comparable on that point.)
+
+\textbf{Approach.} Ran the harness, which performs an orderly
+\cmd{shutdown()} first and an \cmd{SO\_LINGER\{1,0\}} abortive close second,
+with a packet capture and a 1-second state sampler running throughout. Compared
+three views of the same two events: the flags on the wire, the server's own
+logging of what its \cmd{recv()} call returned, and the socket table. Finally
+filtered the capture down to only FIN and RST lines so the two terminations sit
+side by side.
+
+\textbf{Commands and tools.}
+\begin{Verbatim}[fontsize=\small,frame=single]
+su root -c 'tcpdump -l -i lo0 -n -tttt -S "tcp port 5000"' | tee exp6_tcpdump.txt
+while true; do date +%T; netstat -an -p tcp | grep 5000; echo; sleep 1; done \
+    | tee exp6_states.txt
+python3 -u experiment.py 6 2>&1 | tee exp6_harness.txt
+grep -E 'Flags \[(F|R)' exp6_tcpdump.txt | tee exp6_fin_rst_only.txt
+\end{Verbatim}
+\cmd{-S} prints absolute sequence numbers so the FIN's sequence consumption is
+visible. The server distinguishes the two paths explicitly at
+\cmd{exchange\_server.cpp:382} (\cmd{recv()==0}) and \cmd{:393}
+(\cmd{ECONNRESET}).
+
+\shot{/home/vzux/Desktop/A2_evidence/exp6/exp6_server-fin-vs-econnreset.png}
+{Experiment 6 --- the application-visible difference: Part~A
+\texttt{recv() -> 0 : peer closed (FIN)} versus Part~B
+\texttt{recv() -> ECONNRESET : peer reset (RST)}.}
+
+\shot{/home/vzux/Desktop/A2_evidence/exp6/exp6_tcpdump-full-capture.png}
+{Experiment 6 --- the complete 17-packet capture covering both terminations.}
+
+\shot{/home/vzux/Desktop/A2_evidence/exp6/exp6_fin-vs-rst-isolated.png}
+{Experiment 6 --- only the FIN and RST lines: two FINs (Part~A) and three RSTs
+(connection-refused, harness probe, and Part~B's abortive close).}
+
+\shot{/home/vzux/Desktop/A2_evidence/exp6/exp6_states-closed-then-gone.png}
+{Experiment 6 --- the client socket in state \texttt{CLOSED} from 16:17:21 to
+16:17:29, gone at :30 when the fd is finally closed.}
+
+\newpage
+% ---------------------------------------------------------------------------
+\subsection{Experiment 7 --- Backpressure and the Slow Receiver}
+
+\textbf{Question.} How does the Exchange Server's TCP connection to the slow
+client behave as the client stops reading, and what evidence shows whether this
+eventually affects the server's ability to communicate with other clients?
+
+\textbf{Answer.} The connection to the slow client stays \cmd{ESTABLISHED}
+throughout and never errors, but undelivered market data accumulates in its
+kernel receive buffer, climbing monotonically from 0 to a hard ceiling of
+\textbf{85{,}000 bytes}. Over the same period the normal Market-Data client's
+Recv-Q never rose above 17 bytes and both Trader connections kept exchanging
+orders continuously, with all 5{,}000 trades completing. The slow reader
+therefore did \textbf{not} affect the server's ability to serve anyone else ---
+the backlog is confined to its own socket.
+
+The mechanism is TCP flow control plus per-connection output queuing. As the
+slow client stops calling \cmd{recv()}, its receive buffer fills and the window
+it advertises shrinks. The server never blocks on this, because it holds pending
+output in a per-connection application-level queue and only calls \cmd{send()}
+when kqueue reports that socket writable via \cmd{EVFILT\_WRITE}. Sockets that
+are not writable are simply not serviced that iteration; every other descriptor
+continues to be.
+
+\textbf{Why Send-Q stays near zero --- the key subtlety.} \cmd{netstat}'s Send-Q
+shows only the \emph{kernel} socket buffer. Peak server-side Send-Q toward the
+slow client was 34 bytes (Pass~A) and 51 bytes (Pass~B) --- essentially nothing.
+That is not evidence that backpressure is absent; it is evidence that the server
+never over-commits to a socket the kernel will not accept. The backlog lives in
+the server's own userspace output queue, which \cmd{netstat} cannot see. A naive
+server calling a blocking \cmd{send()} in a loop would instead fill the kernel
+buffer, then block inside \cmd{send()} on the slow client's socket, and every
+other client would stall behind it. The near-zero Send-Q is the design working,
+not failing.
+
+\textbf{Two passes: a hypothesis tested and rejected.} Pass~A ran with FreeBSD
+defaults. Because Recv-Q reached 85{,}000 --- above \cmd{net.inet.tcp.recvspace}
+of 65{,}536 --- the initial hypothesis was that receive-buffer auto-tuning
+(\cmd{net.inet.tcp.recvbuf\_auto = 1}) was growing the buffer and absorbing the
+backlog. Pass~B disabled auto-tuning and re-ran identically. The result was
+\textbf{unchanged}: Recv-Q again climbed to exactly 85{,}000 and plateaued, and
+Send-Q again stayed negligible. Auto-tuning was therefore \emph{not} the
+explanation; the 85{,}000-byte ceiling is a stable property of the receive
+socket buffer on this system, and the flat Send-Q is explained by the server's
+own write discipline.
+
+\textbf{Approach.} Ran the harness twice with a 1-second \cmd{netstat}
+sampler capturing Recv-Q and Send-Q on every connection. Recorded the kernel
+buffer limits beforehand so the observed numbers could be compared against the
+configured ceilings, and identified which port belonged to which role from the
+harness's own connection banner so the sampler output could be interpreted.
+Pass~A used the defaults; Pass~B changed exactly one variable
+(\cmd{recvbuf\_auto}) to test whether auto-tuning explained the result, and
+restored it afterwards.
+
+\textbf{Commands and tools.}
+\begin{Verbatim}[fontsize=\small,frame=single]
+sysctl net.inet.tcp.sendspace net.inet.tcp.recvspace kern.ipc.maxsockbuf
+while true; do date +%T; netstat -an -p tcp | grep -E 'Proto|5000'; echo; \
+    sleep 1; done | tee exp7_sendq.txt
+python3 -u experiment.py 7 2>&1 | tee exp7_harness.txt
+grep -E "Market-Data Client:|Trader:" exp7_harness.txt   # role -> port mapping
+su root -c 'sysctl net.inet.tcp.recvbuf_auto=0'          # Pass B only
+\end{Verbatim}
+
+\textbf{Measured values.} Buffers: \cmd{sendspace}~32768,
+\cmd{recvspace}~65536, \cmd{maxsockbuf}~2097152.
+Pass~A (slow~=~40600, normal~=~63111): slow Recv-Q climbed
+$102 \rightarrow 544 \rightarrow \dots \rightarrow 85{,}000$; normal 0--17
+throughout; server Send-Q to slow peaked at 34.
+Pass~B (slow~=~34500, normal~=~44850): slow Recv-Q
+$77{,}180 \rightarrow \dots \rightarrow 85{,}000$ then flat; server Send-Q
+peaked at 51. Both passes completed all 5{,}000 trades.
+
+\shot{/home/vzux/Desktop/A2_evidence/exp7/exp7_bufsizes.png}
+{Experiment 7 --- the configured socket buffer limits.}
+
+\shot{/home/vzux/Desktop/A2_evidence/exp7/exp7_A-slow-recvq-vs-normal.png}
+{Experiment 7, Pass A --- three consecutive samples: the slow client's Recv-Q
+climbing $84{,}065 \rightarrow 84{,}490 \rightarrow 84{,}932$ while the normal
+client sits at 0/17 and both traders keep flowing.}
+
+\shot{/home/vzux/Desktop/A2_evidence/exp7/exp7_A-trades-complete-and-roles.png}
+{Experiment 7, Pass A --- live trade traffic, \texttt{Generated 5000 matching
+trades.}, the clean four-FIN shutdown, and the role-to-port mapping.}
+
+\shot{/home/vzux/Desktop/A2_evidence/exp7/exp7_B-recvbuf-auto-disabled.png}
+{Experiment 7, Pass B --- \texttt{net.inet.tcp.recvbuf\_auto: 1 -> 0}.}
+
+\shot{/home/vzux/Desktop/A2_evidence/exp7/exp7_B-recvq-plateau-85000.png}
+{Experiment 7, Pass B --- with auto-tuning disabled the Recv-Q still reaches and
+holds exactly 85{,}000 across two consecutive samples, disproving the
+auto-tuning hypothesis.}
+
+\shot{/home/vzux/Desktop/A2_evidence/exp7/exp7_B-trades-complete-and-roles.png}
+{Experiment 7, Pass B --- \texttt{Generated 5000 matching trades.}
+confirming the run completed with auto-tuning disabled, plus the clean
+shutdown and role mapping.}
+
+\shot{/home/vzux/Desktop/A2_evidence/exp7/exp7_B-roles.png}
+{Experiment 7, Pass B --- role-to-port mapping.}
+
+\newpage
+% ---------------------------------------------------------------------------
+\subsection{Experiment 8 --- Unexpected Client Disconnection}
+
+\textbf{Question.} When a client disappears unexpectedly while the Exchange
+Server is communicating with it, what happens to their TCP connection, and what
+network-level evidence allows you to determine how the server detects the
+failure?
+
+\textbf{Answer.} The connection is closed \textbf{gracefully}, and the server
+detects the failure exactly as it would detect a polite disconnect:
+\cmd{recv()} returns~0.
+
+The disappearing client was a \emph{separate process} (server fd~8,
+\cmd{127.0.0.1:41329}) killed with \cmd{SIGKILL}, so it had no opportunity to
+run shutdown code, close its socket, or send anything deliberately. Nevertheless
+a normal \textbf{FIN} appeared on the wire at 17:01:09.148094, and the teardown
+was the full four-way exchange: client FIN \cmd{[F.]} $\rightarrow$ server ACK
+(.148173) $\rightarrow$ server FIN (.148281) $\rightarrow$ client ACK (.148290).
+The server logged \cmd{[8] recv() -> 0 : peer closed (FIN)} and closed fd~8.
+
+The reason is that \textbf{socket teardown is the kernel's responsibility, not
+the application's}. When a process dies --- however violently --- the kernel
+reclaims its file descriptors, and closing a TCP socket emits FIN. So an abrupt
+\emph{process} failure still produces an orderly \emph{connection} close, and at
+the socket layer it is indistinguishable from the client calling \cmd{close()}
+itself. This is the key contrast with Experiment~6, where RST was produced by
+\cmd{SO\_LINGER\{1,0\}} --- an explicit application-level choice about \emph{how}
+to close. A crash makes no such choice, so it produces no RST.
+
+Notably, \textbf{306 bytes} of undelivered market data were still sitting unread
+in that client's receive buffer at 17:01:08 (the helper process was parked in
+\cmd{sleep()}, not reading), and FreeBSD still sent FIN rather than a reset.
+
+RST would arise only afterwards, if the server sent further data to the dead
+socket --- the peer's kernel, no longer holding that four-tuple, would answer
+with RST. That did not happen here because the event loop saw
+\cmd{recv()}~$=$~0 immediately and closed its own side within
+187\,$\mu$s, before further market data could be written.
+
+\textbf{The other clients were completely unaffected.} In the same 1-second
+sample where the dead connection vanished (17:01:09), the surviving Market-Data
+client (57334) and both Traders (53315, 29852) remained \cmd{ESTABLISHED}, and
+the capture shows trade traffic to 29852 and 53315 flowing at 17:01:09.077
+before the FIN and resuming at .149233 immediately after. The server states it
+plainly: \cmd{[-] fd=8 closed (3 client(s) still connected)}.
+
+\textbf{Approach.} Ran the harness, which starts a genuinely separate client
+process, generates real trades so the server is actively communicating with it,
+then \cmd{SIGKILL}s that process while a second Market-Data client and two
+Traders stay connected. Observed the packets around the kill, the socket table
+before and after, and the server's own report of what its \cmd{recv()} returned.
+Because the killed client is a separate process the harness never prints its
+port, so the port had to be recovered from the server's accept log.
+
+\textbf{Commands and tools.}
+\begin{Verbatim}[fontsize=\small,frame=single]
+su root -c 'tcpdump -l -i lo0 -n -tttt "tcp port 5000"' | tee exp8_tcpdump.txt
+while true; do date +%T; netstat -an -p tcp | grep 5000; echo; sleep 1; done \
+    | tee exp8_states.txt
+python3 -u experiment.py 8 2>&1 | tee exp8_harness.txt
+grep -E "Market-Data Client|Trader:|accepted fd=" exp8_harness.txt
+\end{Verbatim}
+
+\begin{center}\small
+\begin{tabular}{llll}
+\toprule
+fd & Port & Role & Fate \\
+\midrule
+5 & 57334 & Surviving Market-Data & survives \\
+6 & 53315 & Buyer Trader          & survives \\
+7 & 29852 & Seller Trader         & survives \\
+8 & 41329 & Disappearing Market-Data & \textbf{SIGKILLed} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\shot{/home/vzux/Desktop/A2_evidence/exp8/exp8_roles-and-detection.png}
+{Experiment 8 --- fd-to-port mapping including
+\texttt{accepted fd=8 from 127.0.0.1:41329}, then the kill moment with
+\texttt{[8] recv() -> 0 : peer closed (FIN)} and
+\texttt{3 client(s) still connected}.}
+
+\shot{/home/vzux/Desktop/A2_evidence/exp8/exp8_dead-gone-survivors-established.png}
+{Experiment 8 --- 41329 present with Recv-Q $187 \rightarrow 306$ at 17:01:07--08,
+gone at 17:01:09, while the other three remain \texttt{ESTABLISHED}.}
+
+\shot{/home/vzux/Desktop/A2_evidence/exp8/exp8_tcpdump-kernel-fin.png}
+{Experiment 8 --- the complete four-way close of 41329, sandwiched between trade
+traffic to 29852/53315 before and after: one frame proving the other clients
+kept flowing throughout.}
+
+\newpage
+% ===========================================================================
+\section{Bonus --- Connection Scalability and I/O Design}
+% ===========================================================================
+
+\subsection{Client-generation program}
+
+\cmd{bonus/conn\_generator.cpp} opens and holds $N$ idle TCP connections,
+exchanging no application data. It raises its own \cmd{RLIMIT\_NOFILE} to the
+hard limit, optionally \cmd{bind()}s each client socket round-robin across a
+list of source addresses (see \S\ref{sec:tuple}), reports progress every 5{,}000
+connections, and on failure prints the exact \cmd{errno} together with an
+interpretation. Helper scripts \cmd{bonus/bonus\_run.sh} (runs one level
+end-to-end) and \cmd{bonus/bonus\_measure.sh} (collects every table column in
+one pass) accompany it.
+
+\subsection{Resource-measurement table}
+
+All measurements were taken while the stated number of connections were
+simultaneously \cmd{ESTABLISHED} and idle.
+
+\begin{center}\small
+\begin{tabular}{rrrrrrr}
+\toprule
+Idle conns & Server RSS & CPU & Server FDs & System-wide FDs & Sock-buf & Max established \\
+\midrule
+10{,}000 & 5{,}468 KB  & 0.0\% & 10{,}009 & 20{,}102 / 400{,}000  & 0 / 251{,}575 & 10{,}000 \\
+20{,}000 & 7{,}432 KB  & 0.0\% & 20{,}008 & 40{,}115 / 400{,}000  & 0 / 251{,}575 & 20{,}000 \\
+30{,}000 & 9{,}524 KB  & 0.0\% & 30{,}008 & 60{,}105 / 400{,}000  & 0 / 251{,}575 & 30{,}000 \\
+40{,}000 & 11{,}396 KB & 0.0\% & 40{,}009 & 80{,}102 / 400{,}000  & 0 / 251{,}575 & 40{,}000 \\
+50{,}000 & 13{,}300 KB & 0.0\% & 50{,}008 & 100{,}105 / 400{,}000 & 0 / 251{,}575 & 50{,}000 \\
+60{,}000 & 15{,}616 KB & 0.1\% & 60{,}008 & 120{,}104 / 400{,}000 & 0 / 251{,}575 & 60{,}000 \\
+70{,}000 & 17{,}532 KB & 0.1\% & 70{,}009 & 140{,}102 / 400{,}000 & 0 / 251{,}575 & \textbf{70{,}000} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\emph{Reading the table.} Server FDs $=$ connections $+\,3$ (listening socket,
+kqueue, stdio). System-wide FDs $=$ exactly $2\times$ connections $+\,{\approx}105$:
+both endpoints are local, so every connection consumes \textbf{two} file table
+entries and \textbf{two} socket structures. This factor of two governs every
+system-wide limit in the experiment. Sock-buf is mbuf \emph{clusters} in use
+from \cmd{netstat -m}; it is zero at every level (see Q3). The 10k/40k/70k rows
+are the values in the submitted screenshots; the others come from separate runs
+of the same script, where run-to-run variation is a few KB of RSS.
+
+\subsection{Q1 --- Able to maintain all requested connections?}
+
+Yes at every level from 10{,}000 to 70{,}000 inclusive, \emph{after} tuning; all
+seven runs reported \cmd{SUCCESS: all N connections established}.
+
+Before tuning it failed at \textbf{64{,}909 of 70{,}000} with errno~55
+(\cmd{ENOBUFS}, ``No buffer space available''). That is the first-failure point
+on a default-configured guest; diagnosing it is Q2.
+
+\subsection{Q2 --- First significant bottleneck, with supporting data}
+\label{sec:tuple}
+
+\textbf{The kernel's \cmd{socket} UMA zone} --- not memory, CPU, file
+descriptors or mbufs. From \cmd{vmstat -z} at the moment of failure:
+
+\begin{Verbatim}[fontsize=\small,frame=single]
+ITEM        SIZE   LIMIT     USED    FREE      REQ  FAIL
+socket:     1024, 129967,   62006,  67962,  214502,  110
+\end{Verbatim}
+
+\begin{itemize}\itemsep2pt
+\item \cmd{LIMIT} was 129{,}967 --- identical to the guest's \emph{boot-time}
+      \cmd{kern.maxfiles}.
+\item \cmd{FAIL 110} is the kernel's own count of refused allocations from that
+      zone; the generator observed those same refusals as \cmd{ENOBUFS}.
+\item Because both endpoints are local, $N$ connections need $2N$ socket
+      structures, so the zone caps connections at $129{,}967/2 = 64{,}983$. The
+      run stopped at \textbf{64{,}909} --- within 0.1\% of the prediction.
+\end{itemize}
+
+Everything else had large headroom at that moment, which is what rules the
+alternatives out: server RSS 16.2\,MB of 4\,GB (0.4\%); 130{,}006 open files of
+\cmd{kern.maxfiles} 400{,}000 (32.5\%); 64{,}912 fds of
+\cmd{kern.maxfilesperproc} 200{,}000; \textbf{0} mbuf clusters of 251{,}575; CPU
+0.0\% with 0.34\,s of CPU time accumulated in total.
+
+\textbf{The non-obvious part.} Raising \cmd{kern.maxfiles} from 129{,}967 to
+400{,}000 at runtime did \emph{not} help, because the socket zone is sized once
+at boot from that value. The tunable that actually gates socket allocation is
+\cmd{kern.ipc.maxsockets}, which \emph{is} writable at runtime and does resize
+the zone:
+\begin{Verbatim}[fontsize=\small,frame=single]
+sysctl kern.ipc.maxsockets=400000     # socket zone LIMIT 129967 -> 400000
+\end{Verbatim}
+
+\textbf{A second limit was anticipated and designed around rather than hit.} A
+TCP connection is identified by (src IP, src port, dst IP, dst port). Every
+connection here targets the same \cmd{127.0.0.1:5000}, so three elements are
+fixed and uniqueness rests on the source port alone --- a 16-bit value.
+\cmd{net.inet.ip.portrange} defaults to 10000--65535 $=$ 55{,}536 ports, and even
+widened to 1024--65535 gives only 64{,}512. \textbf{70{,}000 is therefore
+arithmetically unreachable from a single source address.} The generator binds
+each client socket round-robin across three loopback aliases (127.0.0.1,
+127.0.0.2, 127.0.0.3, added with \cmd{ifconfig lo0 alias}), giving
+$3 \times 64{,}512 = 193{,}536$ of tuple space. The server's accept log confirms
+all three addresses in use throughout the run.
+
+\textbf{A third, softer symptom} appeared at ${\approx}65{,}000$ connections: the
+guest stopped accepting new inbound SSH sessions entirely, and recovered the
+instant the connections were released. Existing sessions were unaffected.
+
+\subsection{Q3 --- How the concurrency/I/O design contributes}
+
+The server is a single-threaded \cmd{kqueue()} event loop; it creates no thread
+and no process per connection, and \cmd{procstat -k} confirms one thread
+throughout (Experiments 4 and 5).
+
+The consequence is visible directly in the table. Server RSS rises from
+5{,}468\,KB at 10{,}000 connections to 17{,}532\,KB at 70{,}000 --- a marginal
+cost of $\approx$\,2{,}012\,KB per 10{,}000 connections, i.e.\ \textbf{about 201
+bytes per idle connection}, on a 3.4\,MB baseline, and the relationship is linear
+across all seven levels. CPU stays at 0.0--0.1\% and accumulates 0.33\,s while
+holding 70{,}000 connections, because idle sockets are never ready and so are
+never visited by the loop.
+
+The design therefore contributes to the bottleneck only indirectly: it pushes
+per-connection application cost so low that the application is nowhere near
+being the limit, and what fails first is a \emph{kernel} allocator ceiling. That
+is the intended outcome --- the wall is an OS resource, not the program.
+
+\textbf{Supporting finding.} mbuf cluster usage is \emph{identical}
+(320/696/1016 4k jumbo clusters) at 1{,}000 connections and at 70{,}005. Idle
+sockets allocate \textbf{no socket buffer memory at all}; \cmd{sendspace} and
+\cmd{recvspace} are ceilings applied as data arrives, not reservations made at
+connect time. This is the same property that kept Send-Q near zero in
+Experiment~7, observed from the opposite direction.
+
+\subsection{Q4 --- Would changing the I/O mechanism help?}
+
+No --- every alternative is worse, and the measurements say why.
+
+\textbf{Thread-per-connection:} 70{,}000 threads, each with its own stack. Even
+at a conservative 512\,KB per stack that is $\approx$34\,GB of address space
+against 4\,GB of RAM; at FreeBSD's default it is far more. The measured
+per-connection cost here is $\approx$201 bytes --- roughly four orders of
+magnitude smaller. Thread-per-connection could not reach 70{,}000 on this
+machine at any tuning, and would add context-switch and scheduler cost that
+kqueue avoids entirely.
+
+\textbf{\cmd{select()}:} bounded by \cmd{FD\_SETSIZE} (1024 by default) and
+requires rebuilding and scanning the descriptor set on every call. Unusable at
+this scale.
+
+\textbf{\cmd{poll()}:} no \cmd{FD\_SETSIZE} limit, but the caller passes the
+entire array on every call and the kernel scans all of it --- $O(n)$ per
+iteration in the number of \emph{open} descriptors. At 70{,}000 mostly-idle
+connections that is 70{,}000 entries examined to find the handful that are
+ready. \cmd{kqueue} is $O(\mathrm{ready})$: registration happens once, and
+\cmd{kevent()} returns only what changed.
+
+Since the observed limit is a kernel socket-zone ceiling rather than anything
+the application controls, no change of I/O mechanism would raise it. Only the
+sysctl does; changing the mechanism could only make the application side worse.
+
+\subsection{Q5 --- Quantified trade-off after a change}
+
+One configuration variable changed, everything else held constant:
+
+\begin{center}\small
+\begin{tabular}{rrrl}
+\toprule
+\cmd{kern.ipc.maxsockets} & socket zone LIMIT & Max connections & Result \\
+\midrule
+129{,}967 (boot value) & 129{,}967 & 64{,}909 & \cmd{ENOBUFS} at 64{,}909 \\
+400{,}000              & 400{,}000 & \textbf{70{,}005} & SUCCESS, headroom remains \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Raising the zone from 129{,}967 to 400{,}000 lifted the achievable connection
+count from 64{,}909 to at least 70{,}005 --- an 8\% increase, for a change that
+costs no memory until the sockets are actually created. At 70{,}005 connections
+the zone held 140{,}104 of 400{,}000 entries (35\%), so the new ceiling is
+roughly 200{,}000 connections: the limit has moved well beyond the assignment
+target.
+
+The trade-off is that the zone is a pre-declared kernel ceiling --- raising it
+permits more kernel memory to be committed to sockets if they are created. The
+measured cost of actually reaching 70{,}000 was 17.1\,MB of server RSS and
+140{,}102 file table entries, both trivial against 4\,GB of RAM, which is why
+the increase is essentially free on this system.
+
+\textbf{A second change was considered and rejected on evidence:} reducing
+\cmd{net.inet.tcp.sendspace}/\cmd{recvspace} to shrink per-connection buffer
+memory. The measurements show idle sockets allocate zero mbuf clusters, so that
+change would have measured no difference. It is recorded here because ruling it
+out is what established that socket-buffer memory is not on the critical path.
+
+\subsection{Reproducing the tuning}
+
+Runtime-only; re-apply after any reboot (as root):
+\begin{Verbatim}[fontsize=\small,frame=single]
+sysctl kern.ipc.maxsockets=400000    # the important one -- sizes the socket zone
+sysctl kern.maxfiles=400000
+sysctl kern.maxfilesperproc=200000
+sysctl kern.ipc.somaxconn=4096
+sysctl net.inet.ip.portrange.first=1024
+ifconfig lo0 alias 127.0.0.2/32
+ifconfig lo0 alias 127.0.0.3/32
+\end{Verbatim}
+Then: \cmd{sh bonus/bonus\_run.sh <count>} for one level, or
+\cmd{sh bonus/bonus\_measure.sh 5000} to measure a running server.
+
+\subsection{Bonus screenshots}
+
+\shot{/home/vzux/Desktop/A2_evidence/bonus/bonus_10000_measurements.png}
+{Bonus --- 10{,}000 idle connections: all measurements plus
+\texttt{SUCCESS: all 10000 connections established}.}
+
+\shot{/home/vzux/Desktop/A2_evidence/bonus/bonus_40000_measurements.png}
+{Bonus --- 40{,}000 idle connections.}
+
+\shot{/home/vzux/Desktop/A2_evidence/bonus/bonus_70000_measurements.png}
+{Bonus --- 70{,}000 idle connections: 17.1\,MB RSS, 0.1\% CPU, 70{,}009 server
+fds, 140{,}102 of 400{,}000 system-wide files, zero mbuf clusters.}
+
+\shot{/home/vzux/Desktop/A2_evidence/bonus/bonus_socket-zone-limit-evidence.png}
+{Bonus --- the bottleneck evidence. The \texttt{socket} UMA zone now at
+\texttt{LIMIT 400000}, with \texttt{FAIL 110} still recorded from when the limit
+was 129{,}967.}
+
+\end{document}

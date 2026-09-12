@@ -4,9 +4,7 @@ TCP-based simulated trading system: one Exchange Server, many Trader and
 Market-Data clients, all over raw POSIX sockets. Built and tested on
 **FreeBSD 14.4-RELEASE**.
 
-> Rename the submission folder/zip to `A2_<ROLL1>_<ROLL2>.zip` with the two
-> roll numbers in **alphabetical order** (handout 7.1). This scaffold ships as
-> `A2_ROLL1_ROLL2` — replace both placeholders.
+Team: **Rohit Meena** (2024CS10030), **Subarno Saha** (2024CS50431)
 
 ## Language / toolchain
 - Language: **C++17**
@@ -20,6 +18,11 @@ make            # builds bin/exchange_server, bin/trader_client,
                 # bin/market_data_client, bin/conn_generator
 ```
 (If BSD `make` gives trouble: `pkg install gmake` then `gmake`.)
+
+**Run `make` first — the launchers depend on it.** `server/run-server` and the
+two client launchers `exec` the binaries in `bin/`, which is created by the
+build. No prebuilt binaries are shipped, so `make` is required before
+`server/run-server`, the client launchers, or `experiment.py` will work.
 
 ## Run
 Start the server (host + port):
@@ -73,3 +76,24 @@ report.pdf                   experiment answers + implementation decisions
 ## Bonus
 See `bonus/conn_generator.cpp` and `report.pdf`. Raise `ulimit -n` and the
 relevant `sysctl` fd limits in the VM before running large connection counts.
+
+## Bonus — 70,000 idle connections (handout 6.9)
+`bonus/conn_generator.cpp` opens and holds N idle TCP connections:
+```sh
+./bin/conn_generator 127.0.0.1 5000 70000 127.0.0.1,127.0.0.2,127.0.0.3
+```
+Helpers: `bonus/bonus_run.sh <count>` runs one measurement level end to end;
+`bonus/bonus_measure.sh 5000` measures a running server.
+
+Reaching 70,000 requires kernel tuning first (as root; runtime-only, re-apply
+after a reboot). Full rationale is in `report.pdf` §3.
+
+```sh
+sysctl kern.ipc.maxsockets=400000    # sizes the socket UMA zone -- the real limit
+sysctl kern.maxfiles=400000
+sysctl kern.maxfilesperproc=200000
+sysctl kern.ipc.somaxconn=4096
+sysctl net.inet.ip.portrange.first=1024
+ifconfig lo0 alias 127.0.0.2/32      # extra source IPs: 70k needs >65k tuples
+ifconfig lo0 alias 127.0.0.3/32
+```

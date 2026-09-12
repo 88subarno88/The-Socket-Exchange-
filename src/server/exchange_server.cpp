@@ -216,7 +216,12 @@ static bool handle_line(Server& s, ClientSession& c, const std::string& line) {
     return true;
 }
 
-// Tear down a connection: remove resting orders, unregister from kqueue, close.
+// Tear down a connection: unregister from kqueue and close the socket.
+// NOTE: resting orders are deliberately LEFT IN THE BOOK. Handout 2.6 says a
+// disconnect does not cancel them -- they can still match, and subscribed
+// Market-Data clients still get the TRADE; only the departed trader misses its
+// BOUGHT/SOLD. (OrderBook::remove_orders_of exists for CANCEL-style use and is
+// intentionally NOT called here.)
 static void close_session(Server& s, int fd) {
     auto it = s.sessions.find(fd);
     if (it == s.sessions.end()) return;   // already torn down -- never double-close
